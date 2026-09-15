@@ -33,7 +33,7 @@ fi
 if [[ ! -f "$BUNDLE" ]]; then
   warn "$BUNDLE not found (run ./scripts/build.sh to produce it)"
 else
-  size=$(stat -f '%z' "$BUNDLE" 2>/dev/null || stat -c '%s' "$BUNDLE" 2>/dev/null)
+  size=$(stat -c '%s' "$BUNDLE" 2>/dev/null || stat -f '%z' "$BUNDLE" 2>/dev/null || echo 0)
   size_mb=$((size / 1024 / 1024))
   echo "bundle: $BUNDLE (${size_mb} MB)"
   if [[ $size_mb -gt 50 ]]; then

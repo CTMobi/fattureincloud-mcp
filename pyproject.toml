@@ -38,7 +38,7 @@ classifiers = [
 ]
 dependencies = [
     "fattureincloud-python-sdk>=2.0.0",
-    "mcp>=1.0.0",
+    "mcp>=1.0.0,<2",
     "python-dotenv>=1.0.0",
 ]
 

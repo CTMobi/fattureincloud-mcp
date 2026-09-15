@@ -1581,3 +1581,73 @@ def test_create_invoice_accepts_an_explicit_vat_id(server_module):
 
     item = create.call_args.kwargs["create_issued_document_request"]["data"]["items_list"][0]
     assert item["vat"] == {"id": 6}
+
+
+# --------------------------------------------------------------------------
+# review round 6
+# --------------------------------------------------------------------------
+
+def test_create_invoice_with_vat_id_keeps_the_gross_in_the_installment(server_module):
+    """vat_id is the way out of an ambiguous rate, so the caller has no reason
+    to also pass vat_rate: the percentage has to come from the registry."""
+    server = server_module
+    created = MagicMock()
+    created.data.to_dict.return_value = {"id": 1, "number": 1, "date": "2026-01-10"}
+
+    with patch.object(server.issued_api, "create_issued_document", return_value=created) as create, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme", "ei_code": "ABC1"}):
+        result = _run(server.call_tool("create_invoice", {
+            "client_id": 5, "date": "2026-01-10", "visible_subject": "Test",
+            "items": [{"name": "Item", "qty": 1, "net_price": 100.0, "vat_id": 0}],
+        }))
+
+    body = create.call_args.kwargs["create_issued_document_request"]["data"]
+    assert body["items_list"][0]["vat"] == {"id": 0}
+    assert body["payments_list"][0]["amount"] == 122.0
+    assert json.loads(result[0].text)["total"] == 122.0
+
+
+def test_create_invoice_rejects_an_unknown_vat_id(server_module):
+    server = server_module
+
+    with patch.object(server.issued_api, "create_issued_document") as create, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme", "ei_code": "ABC1"}):
+        result = _run(server.call_tool("create_invoice", {
+            "client_id": 5, "date": "2026-01-10", "visible_subject": "Test",
+            "items": [{"name": "Item", "qty": 1, "net_price": 100.0, "vat_id": 99}],
+        }))
+
+    assert not create.called
+    payload = json.loads(result[0].text)
+    assert payload["success"] is False
+    assert "vat_id" in payload["error"]
+
+
+def test_list_invoices_accepts_a_page(server_module):
+    """truncated: true is only actionable if the next page can be asked for."""
+    server = server_module
+    listed = MagicMock()
+    listed.data = []
+    listed.last_page = "3"  # the API may hand the page count back as a string
+
+    with patch.object(server.issued_api, "list_issued_documents", return_value=listed) as call:
+        result = _run(server.call_tool("list_invoices", {"year": 2026, "page": 2}))
+
+    assert call.call_args.kwargs["page"] == 2
+    payload = json.loads(result[0].text)
+    assert payload["page"] == 2
+    assert payload["pages"] == 3
+    assert payload["truncated"] is True
+
+
+def test_list_received_documents_accepts_a_page(server_module):
+    server = server_module
+    listed = MagicMock()
+    listed.data = []
+    listed.last_page = 2
+
+    with patch.object(server.received_api, "list_received_documents", return_value=listed) as call:
+        result = _run(server.call_tool("list_received_documents", {"year": 2026, "page": 2}))
+
+    assert call.call_args.kwargs["page"] == 2
+    assert json.loads(result[0].text)["page"] == 2

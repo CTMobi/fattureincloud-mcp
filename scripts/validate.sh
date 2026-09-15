@@ -96,10 +96,12 @@ print("\n".join(sorted(t.name for t in asyncio.run(server.list_tools()))))
       # The bundle carries its own manifest: comparing it against the bundled
       # runtime keeps "the bundle is inconsistent" apart from "the bundle is
       # simply older than the checkout", which are different things to fix.
-      packed=$(jq -r '.tools[].name' "$staging/manifest.json" 2>/dev/null | LC_ALL=C sort)
+      packed=$(jq -r '.tools[].name' "$staging/manifest.json" 2>/dev/null | LC_ALL=C sort) || packed=""
       packed_version=$(jq -r '.version' "$staging/manifest.json" 2>/dev/null || echo "?")
 
-      if [[ -z "$runtime" ]]; then
+      if [[ -z "$packed" ]]; then
+        err "the bundle has no readable manifest.json: rebuild it with ./scripts/build.sh"
+      elif [[ -z "$runtime" ]]; then
         err "the bundled server.py did not start (the extension would fail at launch)"
         sed 's/^/     /' "$staging/import.err" >&2 || true
       elif [[ "$runtime" != "$packed" ]]; then

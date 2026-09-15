@@ -235,10 +235,13 @@ def _payment_days_of(doc):
 
 
 def _page_count(response):
-    """`last_page` as an int, defensively: a listing is one page unless the API
-    says otherwise."""
-    last_page = getattr(response, "last_page", 1)
-    return last_page if isinstance(last_page, int) and last_page > 0 else 1
+    """`last_page` as an int: a listing is one page unless the API says
+    otherwise, including when it says it as a string."""
+    try:
+        last_page = int(getattr(response, "last_page", 1))
+    except (TypeError, ValueError):
+        return 1
+    return last_page if last_page > 0 else 1
 
 
 def _received_document_type(value):
@@ -317,6 +320,20 @@ def resolve_vat_type(rate):
     return matches[0], None
 
 
+def resolve_vat_id(vat_id):
+    """Look up a vat type by id. The percentage is needed for the local total,
+    and the id deserves the same validation `vat_rate` gets."""
+    types = fetch_vat_types(company_id=COMPANY_ID)
+    if not types:
+        return None, ("Impossibile leggere l'anagrafica IVA (/info/vat_types): "
+                      "riprova, l'aliquota non può essere impostata senza.")
+    for vat_type in types:
+        if vat_type.get("id") == vat_id:
+            return vat_type, None
+    options = [(t["id"], t.get("description")) for t in types]
+    return None, f"vat_id {vat_id} non esiste nell'anagrafica IVA. Disponibili: {options}."
+
+
 def build_entity_from_client(client_id, client_data=None):
     if not client_data:
         client_data = get_client_by_id(client_id)
@@ -347,7 +364,9 @@ def build_items_list(items_data, negate=False):
     items_list = []
     for item in items_data:
         if item.get("vat_id") is not None:
-            vat_type = {"id": item["vat_id"], "value": item.get("vat_rate")}
+            vat_type, error = resolve_vat_id(item["vat_id"])
+            if error:
+                return None, error
         else:
             vat_type, error = resolve_vat_type(item.get("vat_rate", 22))
             if error:
@@ -484,14 +503,15 @@ async def list_tools():
     return [
         Tool(
             name="list_invoices",
-            description="Lista documenti emessi. Parametri: year (int), month (int opzionale), query (str opzionale), type (str opzionale: invoice, credit_note, proforma — default: invoice)",
+            description="Lista documenti emessi. Ritorna {count, page, pages, truncated, documents}: una pagina di 100 documenti, con truncated=true se ce ne sono altre — in quel caso chiedi la pagina successiva con page. Parametri: year (int), month (int opzionale), query (str opzionale), type (str opzionale: invoice, credit_note, proforma — default: invoice), page (int opzionale)",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "year": {"type": "integer", "description": "Anno (es. 2024)"},
                     "month": {"type": "integer", "description": "Mese 1-12 (opzionale)"},
-                    "query": {"type": "string", "description": "Filtro testuale (opzionale)"},
-                    "type": {"type": "string", "description": "Tipo documento: invoice (default), credit_note, proforma"}
+                    "query": {"type": "string", "description": "Filtro testuale (opzionale, applicato alla pagina richiesta)"},
+                    "type": {"type": "string", "description": "Tipo documento: invoice (default), credit_note, proforma"},
+                    "page": {"type": "integer", "description": "Pagina dei risultati (default 1, 100 documenti per pagina — vedi truncated nella risposta)"}
                 },
                 "required": ["year"]
             },
@@ -748,7 +768,7 @@ async def list_tools():
         ),
         Tool(
             name="list_received_documents",
-            description="Lista fatture PASSIVE (ricevute dai fornitori). Parametri: year, month (opzionale), type (opzionale: expense, passive_credit_note, passive_delivery_note, self_invoice)",
+            description="Lista fatture PASSIVE (ricevute dai fornitori). Ritorna {count, page, pages, truncated, documents}: una pagina di 100 documenti, con truncated=true se ce ne sono altre — in quel caso chiedi la pagina successiva con page. Parametri: year, month (opzionale), type (opzionale: expense, passive_credit_note, passive_delivery_note, self_invoice), page (int opzionale)",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -759,7 +779,8 @@ async def list_tools():
                         "enum": list(RECEIVED_DOCUMENT_TYPES),
                         "description": "Tipo: expense (default), passive_credit_note, passive_delivery_note, self_invoice"
                     },
-                    "query": {"type": "string", "description": "Filtro testuale (opzionale)"}
+                    "query": {"type": "string", "description": "Filtro testuale (opzionale, applicato alla pagina richiesta)"},
+                    "page": {"type": "integer", "description": "Pagina dei risultati (default 1, 100 documenti per pagina — vedi truncated nella risposta)"}
                 },
                 "required": ["year"]
             },
@@ -890,8 +911,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 last_day = 31 if month in [1,3,5,7,8,10,12] else 30 if month in [4,6,9,11] else 29
                 q = f"date >= '{year}-{month:02d}-01' and date <= '{year}-{month:02d}-{last_day}'"
 
+            page = arguments.get("page") or 1
             response = issued_api.list_issued_documents(
-                company_id=COMPANY_ID, type=doc_type, q=q, per_page=100, fieldset="detailed"
+                company_id=COMPANY_ID, type=doc_type, q=q,
+                per_page=100, page=page, fieldset="detailed"
             )
             invoices = []
             for doc in (response.data or []):
@@ -915,6 +938,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             pages = _page_count(response)
             payload = {
                 "count": len(invoices),
+                "page": page,
                 "pages": pages,
                 "truncated": pages > 1,
                 "documents": invoices,
@@ -1567,8 +1591,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             if month:
                 last_day = 31 if month in [1,3,5,7,8,10,12] else 30 if month in [4,6,9,11] else 29
                 q = f"date >= '{year}-{month:02d}-01' and date <= '{year}-{month:02d}-{last_day}'"
+            page = arguments.get("page") or 1
             response = received_api.list_received_documents(
-                company_id=COMPANY_ID, type=doc_type, q=q, per_page=100, fieldset="detailed"
+                company_id=COMPANY_ID, type=doc_type, q=q,
+                per_page=100, page=page, fieldset="detailed"
             )
             docs = []
             for doc in (response.data or []):
@@ -1588,6 +1614,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             pages = _page_count(response)
             payload = {
                 "count": len(docs),
+                "page": page,
                 "pages": pages,
                 "truncated": pages > 1,
                 "documents": docs,

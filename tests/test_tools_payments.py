@@ -1163,3 +1163,61 @@ def test_set_payment_rejects_non_integer_payment_index(server_module, index):
 
     assert not modify.called
     assert "payment_index" in json.loads(result[0].text)["error"]
+
+
+# --------------------------------------------------------------------------
+# FIC PUT semantics (openapi-enriched.yaml + fattureincloud/api discussions)
+# --------------------------------------------------------------------------
+
+def test_set_payment_received_sends_entity(server_module):
+    """ModifyReceivedDocumentRequest marks data.entity required, unlike the
+    issued one (openapi-enriched.yaml line 9453)."""
+    server = server_module
+    doc = _received_doc([_rate(610.0, "2026-02-09")])
+
+    with patch.object(server.received_api, "get_received_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.received_api, "modify_received_document",
+                      return_value=_doc_response(doc)) as modify:
+        _run(server.call_tool("set_payment", {
+            "document_id": 99, "document_type": "received", "status": "paid",
+        }))
+
+    data = _sent_data(modify, "modify_received_document_request")
+    assert data["entity"] == {"name": "Supplier Srl", "vat_number": "98765432109"}
+
+
+def test_set_payment_warns_when_the_document_comes_back_emptied(server_module):
+    """Residual risk on the partial-PUT assumption: if the response shows the
+    line items gone, say so instead of reporting a clean success."""
+    server = server_module
+    doc = _issued_doc([_rate(1220.0, "2026-02-09")])
+    emptied = _issued_doc([_rate(1220.0, "2026-02-09", "paid", paid_date="2026-02-05")])
+    emptied["items_list"] = []
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document",
+                      return_value=_doc_response(emptied)):
+        result = _run(server.call_tool("set_payment", {
+            "document_id": 42, "document_type": "issued", "status": "paid",
+        }))
+
+    payload = json.loads(result[0].text)
+    assert "warning" in payload
+    assert "items_list" in payload["warning"]
+
+
+def test_set_payment_does_not_warn_on_a_normal_response(server_module):
+    server = server_module
+    doc = _issued_doc([_rate(1220.0, "2026-02-09")])
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document",
+                      return_value=_doc_response(doc)):
+        result = _run(server.call_tool("set_payment", {
+            "document_id": 42, "document_type": "issued", "status": "paid",
+        }))
+
+    assert "warning" not in json.loads(result[0].text)

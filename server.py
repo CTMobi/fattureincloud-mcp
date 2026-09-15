@@ -1660,8 +1660,16 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             data = {"payments_list": payments}
             if d.get("type"):
                 data["type"] = _enum_value(d["type"])
-            if doc_kind == "issued" and d.get("show_totals"):
-                data["show_totals"] = _enum_value(d["show_totals"])
+            if doc_kind == "issued":
+                if d.get("show_totals"):
+                    data["show_totals"] = _enum_value(d["show_totals"])
+            else:
+                # ModifyReceivedDocumentRequest marks data.entity required
+                # (openapi-enriched.yaml), unlike the issued document one.
+                entity = d.get("entity") or {}
+                if hasattr(entity, "to_dict"):
+                    entity = entity.to_dict()
+                data["entity"] = {k: v for k, v in entity.items() if v is not None}
             body = {"data": data}
             if doc_kind == "issued":
                 response = issued_api.modify_issued_document(
@@ -1698,6 +1706,18 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     residuo += amount
                 view.append(row)
 
+            # FIC does not document what a PUT does with the fields it is not
+            # given; staff describe it as a merge, but nothing guarantees it.
+            # The response is the document as stored, so check it rather than
+            # reporting a clean success over a document that lost its content.
+            warning = None
+            if (d.get("items_list") or []) and not (updated.get("items_list") or []):
+                warning = (
+                    "Il documento è tornato dall'API senza items_list: la PUT potrebbe aver "
+                    "sostituito il documento invece di aggiornarne solo le rate. Verifica le "
+                    "righe dal pannello FattureInCloud prima di registrare altri pagamenti."
+                )
+
             number = updated.get("number") or d.get("number") or d.get("invoice_number")
             counterparty = (updated.get("entity") or d.get("entity") or {}).get("name")
             verb = "Incasso" if doc_kind == "issued" else "Pagamento"
@@ -1713,6 +1733,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "residuo": round(residuo, 2),
                 "message": f"{verb} {azione} su {len(targets)} rata/e del documento #{number}.",
             }
+            if warning:
+                result["warning"] = warning
             return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
 
         elif name == "get_received_document":

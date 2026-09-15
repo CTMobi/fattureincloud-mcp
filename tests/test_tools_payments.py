@@ -1915,3 +1915,81 @@ def test_create_invoice_rejects_malformed_lines(server_module, items):
     payload = json.loads(result[0].text)
     assert payload["success"] is False
     assert "posizione 0" in payload["error"]
+
+
+# --------------------------------------------------------------------------
+# review round 13
+# --------------------------------------------------------------------------
+
+def test_duplicate_invoice_preserves_end_of_month_terms(server_module):
+    """The third rebuild path: it computed the terms type and then wrote the
+    constant anyway."""
+    server = server_module
+    doc = _issued_doc([_rate(1220.0, "2026-02-28",
+                             payment_terms={"days": 30, "type": "end_of_month"})])
+    created = MagicMock()
+    created.data.to_dict.return_value = {"id": 2, "number": 9, "date": "2026-03-01"}
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "create_issued_document",
+                      return_value=created) as create, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme", "ei_code": "A1"}):
+        _run(server.call_tool("duplicate_invoice", {
+            "source_document_id": 42, "new_date": "2026-03-01",
+        }))
+
+    payment = create.call_args.kwargs["create_issued_document_request"]["data"]["payments_list"][0]
+    assert payment["payment_terms"] == {"days": 30, "type": "end_of_month"}
+
+
+@pytest.mark.parametrize("arguments", [
+    {"supplier_name": "Supplier Srl", "amount_net": None},
+    {"supplier_name": "Supplier Srl", "amount_net": True},
+    {"supplier_name": "Supplier Srl", "amount_net": "100"},
+    {"supplier_name": 123, "amount_net": 100.0},
+])
+def test_create_received_document_rejects_malformed_amounts(server_module, arguments):
+    """amount_net and amount_vat are the passive-side qty/net_price: a bool
+    registers a 1.00 EUR expense, a null raises inside the generic handler."""
+    server = server_module
+
+    with patch.object(server.received_api, "create_received_document") as create:
+        result = _run(server.call_tool("create_received_document", arguments))
+
+    assert not create.called
+    assert json.loads(result[0].text)["success"] is False
+
+
+def test_create_invoice_names_a_non_list_items_argument(server_module):
+    """Iterating a string yields characters: the refusal pointed at a line
+    that does not exist."""
+    server = server_module
+
+    with patch.object(server.issued_api, "create_issued_document") as create, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme", "ei_code": "A1"}):
+        result = _run(server.call_tool("create_invoice", {
+            "client_id": 5, "date": "2026-01-10", "visible_subject": "Test",
+            "items": "Consulenza",
+        }))
+
+    assert not create.called
+    error = json.loads(result[0].text)["error"]
+    assert "items" in error
+    assert "posizione 0" not in error
+
+
+def test_create_received_document_treats_a_null_vat_as_zero(server_module):
+    """Optional field: a null is an absent value, as elsewhere in this PR."""
+    server = server_module
+    created = MagicMock()
+    created.data.to_dict.return_value = {"id": 9, "type": "expense", "date": "2026-01-10"}
+
+    with patch.object(server.received_api, "create_received_document",
+                      return_value=created) as create:
+        result = _run(server.call_tool("create_received_document", {
+            "supplier_name": "Supplier Srl", "amount_net": 100.0, "amount_vat": None,
+        }))
+
+    assert json.loads(result[0].text)["success"] is True
+    assert create.call_args.kwargs["create_received_document_request"]["data"]["amount_gross"] == 100.0

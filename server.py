@@ -372,6 +372,8 @@ def build_entity_from_client(client_id, client_data=None):
 def build_items_list(items_data, negate=False):
     """Build the items payload. Returns (items, error): the VAT rate has to be
     resolved to a vat type id, since FIC ignores the percentage in the body."""
+    if not isinstance(items_data, list):
+        return None, f"items deve essere una lista di righe: ricevuto {type(items_data).__name__}."
     if not items_data:
         return None, ("items è vuoto: il documento resterebbe senza righe, con una rata di "
                       "importo zero, e su update_document cancellerebbe quelle esistenti.")
@@ -517,7 +519,7 @@ async def list_tools():
     item_schema = {
         "type": "object",
         "properties": {
-            "name": {"type": "string", "description": "Nome prodotto/servizio"},
+            "name": {"type": "string", "minLength": 1, "description": "Nome prodotto/servizio"},
             "description": {"type": "string", "description": "Descrizione estesa"},
             "qty": {"type": "number", "description": "Quantità"},
             "net_price": {"type": "number", "description": "Prezzo netto unitario (sempre positivo)"},
@@ -1487,7 +1489,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "payments_list": [{"amount": round(total_gross, 2),
                                    "due_date": due_date.strftime("%Y-%m-%d"),
                                    "status": "not_paid",
-                                   "payment_terms": {"days": payment_days, "type": "standard"}}]
+                                   "payment_terms": {"days": payment_days, "type": payment_terms_type}}]
             }
             if revenue_center:
                 body_data["rc_center"] = revenue_center
@@ -2007,9 +2009,17 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             doc_type, type_error = _received_document_type(arguments.get("type", "expense"))
             if type_error:
                 return _error(type_error)
+            if not (isinstance(arguments.get("supplier_name"), str)
+                    and arguments["supplier_name"].strip()):
+                return _error("supplier_name non valido: serve una stringa non vuota.")
+            amount_net = arguments.get("amount_net")
+            amount_vat = arguments.get("amount_vat")
+            amount_vat = 0 if amount_vat is None else amount_vat
+            for field, value in (("amount_net", amount_net), ("amount_vat", amount_vat)):
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    return _error(f"{field} = {value!r}: serve un numero.")
+
             date_str = arguments.get("date", datetime.now().strftime("%Y-%m-%d"))
-            amount_net = arguments["amount_net"]
-            amount_vat = arguments.get("amount_vat", 0)
 
             entity = {"name": arguments["supplier_name"]}
             if arguments.get("supplier_vat_number"):

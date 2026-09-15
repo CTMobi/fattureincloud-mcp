@@ -26,8 +26,10 @@ from fattureincloud_python_sdk.models.received_document import ReceivedDocument
 
 VAT_TYPES = [
     {"id": 0, "value": 22.0, "description": "22%", "is_disabled": False, "default": True},
+    {"id": 1, "value": 4.0, "description": "4%", "is_disabled": False, "default": False},
     {"id": 3, "value": 10.0, "description": "10%", "is_disabled": False, "default": False},
     {"id": 6, "value": 0.0, "description": "Non imponibile", "is_disabled": False, "default": False},
+    {"id": 9, "value": 22.0, "description": "22% dismessa", "is_disabled": True, "default": False},
 ]
 
 ACCOUNTS = [
@@ -1649,5 +1651,45 @@ def test_list_received_documents_accepts_a_page(server_module):
     with patch.object(server.received_api, "list_received_documents", return_value=listed) as call:
         result = _run(server.call_tool("list_received_documents", {"year": 2026, "page": 2}))
 
+    payload = json.loads(result[0].text)
     assert call.call_args.kwargs["page"] == 2
-    assert json.loads(result[0].text)["page"] == 2
+    assert payload["page"] == 2
+    # last page: asking for another one would return an empty list
+    assert payload["truncated"] is False
+
+
+# --------------------------------------------------------------------------
+# review round 7
+# --------------------------------------------------------------------------
+
+def test_create_invoice_rejects_a_disabled_vat_id(server_module):
+    """resolve_vat_type skips disabled rates, so vat_id must not let one in."""
+    server = server_module
+
+    with patch.object(server.issued_api, "create_issued_document") as create, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme", "ei_code": "A1"}):
+        result = _run(server.call_tool("create_invoice", {
+            "client_id": 5, "date": "2026-01-10", "visible_subject": "Test",
+            "items": [{"name": "Item", "qty": 1, "net_price": 100.0, "vat_id": 9}],
+        }))
+
+    assert not create.called
+    payload = json.loads(result[0].text)
+    assert payload["success"] is False
+    assert "disattivata" in payload["error"]
+
+
+@pytest.mark.parametrize("vat_id", [True, 1.0])
+def test_create_invoice_rejects_a_non_integer_vat_id(server_module, vat_id):
+    """`t["id"] == True` is true for id 1: a boolean would bill at 4%."""
+    server = server_module
+
+    with patch.object(server.issued_api, "create_issued_document") as create, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme", "ei_code": "A1"}):
+        result = _run(server.call_tool("create_invoice", {
+            "client_id": 5, "date": "2026-01-10", "visible_subject": "Test",
+            "items": [{"name": "Item", "qty": 1, "net_price": 100.0, "vat_id": vat_id}],
+        }))
+
+    assert not create.called
+    assert "vat_id" in json.loads(result[0].text)["error"]

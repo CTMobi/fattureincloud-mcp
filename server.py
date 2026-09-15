@@ -323,12 +323,17 @@ def resolve_vat_type(rate):
 def resolve_vat_id(vat_id):
     """Look up a vat type by id. The percentage is needed for the local total,
     and the id deserves the same validation `vat_rate` gets."""
+    if isinstance(vat_id, bool) or not isinstance(vat_id, int):
+        return None, "vat_id deve essere un intero (vedi l'elenco in list_vat_types o nel rifiuto di vat_rate)."
     types = fetch_vat_types(company_id=COMPANY_ID)
     if not types:
         return None, ("Impossibile leggere l'anagrafica IVA (/info/vat_types): "
                       "riprova, l'aliquota non può essere impostata senza.")
     for vat_type in types:
         if vat_type.get("id") == vat_id:
+            if vat_type.get("is_disabled"):
+                return None, (f"vat_id {vat_id} ({vat_type.get('description')}) è disattivata "
+                              "nell'anagrafica IVA: scegline una attiva.")
             return vat_type, None
     options = [(t["id"], t.get("description")) for t in types]
     return None, f"vat_id {vat_id} non esiste nell'anagrafica IVA. Disponibili: {options}."
@@ -940,7 +945,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "count": len(invoices),
                 "page": page,
                 "pages": pages,
-                "truncated": pages > 1,
+                "truncated": page < pages,
                 "documents": invoices,
             }
             return [TextContent(type="text", text=json.dumps(payload, indent=2, ensure_ascii=False))]
@@ -1616,7 +1621,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "count": len(docs),
                 "page": page,
                 "pages": pages,
-                "truncated": pages > 1,
+                "truncated": page < pages,
                 "documents": docs,
             }
             return [TextContent(type="text", text=json.dumps(payload, indent=2, ensure_ascii=False))]

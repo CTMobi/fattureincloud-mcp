@@ -16,7 +16,7 @@ BUNDLE="dist/fattureincloud.mcpb"
 MANIFEST="manifest.json"
 fail=0
 warn() { echo "WARN: $*" >&2; }
-err()  { echo "FAIL: $*" >&2; fail=1; }
+err()  { echo "FAIL: $*" >&2; fail=$((fail + 1)); }
 
 # 1. manifest.json passes mcpb schema validation
 if [[ ! -f "$MANIFEST" ]]; then
@@ -47,10 +47,14 @@ fi
 
 # 2. Version coherence
 if [[ -f "$MANIFEST" ]] && command -v jq >/dev/null 2>&1; then
-  manifest_version=$(jq -r '.version' "$MANIFEST")
+  manifest_version=$(jq -r '.version' "$MANIFEST" 2>/dev/null) || manifest_version=""
   pyproject_version=$(grep -E '^version = "' pyproject.toml | head -1 | sed -E 's/^version = "(.+)"/\1/')
   changelog_version=$(grep -m1 -E '^## v' CHANGELOG.md | sed -E 's/^## v//')
 
+  if [[ -z "$manifest_version" || "$manifest_version" == "null" ]]; then
+    err "$MANIFEST is not readable as JSON (or has no version)"
+    manifest_version=""
+  fi
   echo "manifest.json:    $manifest_version"
   echo "pyproject.toml:   $pyproject_version"
   echo "CHANGELOG (top):  $changelog_version"
@@ -70,8 +74,11 @@ fi
 #    starts at all — a dependency that breaks the entry point (as mcp 2.x did)
 #    shows up here instead of at the user's first launch.
 if [[ -f "$MANIFEST" ]] && command -v jq >/dev/null 2>&1; then
-  declared=$(jq -r '.tools[].name' "$MANIFEST" | LC_ALL=C sort)
-  echo "manifest declares $(wc -l <<< "$declared") tools"
+  declared=$(jq -r '.tools[].name' "$MANIFEST" 2>/dev/null | LC_ALL=C sort) || declared=""
+  if [[ -z "$declared" ]]; then
+    err "$MANIFEST is not readable as JSON, or declares no tools"
+  fi
+  echo "manifest declares $([[ -z "$declared" ]] && echo 0 || wc -l <<< "$declared") tools"
 
   if [[ ! -f "$BUNDLE" ]]; then
     warn "no bundle to inspect; skipping runtime tool check (run ./scripts/build.sh)"
@@ -100,7 +107,7 @@ print("\n".join(sorted(t.name for t in asyncio.run(server.list_tools()))))
       packed_version=$(jq -r '.version' "$staging/manifest.json" 2>/dev/null || echo "?")
 
       if [[ -z "$packed" ]]; then
-        err "the bundle has no readable manifest.json: rebuild it with ./scripts/build.sh"
+        err "the bundled manifest.json is unreadable or declares no tools: rebuild with ./scripts/build.sh"
       elif [[ -z "$runtime" ]]; then
         err "the bundled server.py did not start (the extension would fail at launch)"
         sed 's/^/     /' "$staging/import.err" >&2 || true
@@ -133,7 +140,7 @@ fi
 
 # 5. Privacy policy URL(s) reachable
 if [[ -f "$MANIFEST" ]] && command -v jq >/dev/null 2>&1; then
-  urls=$(jq -r '.privacy_policies[]? // empty' "$MANIFEST")
+  urls=$(jq -r '.privacy_policies[]? // empty' "$MANIFEST" 2>/dev/null) || urls=""
   if [[ -n "$urls" ]]; then
     while IFS= read -r url; do
       [[ -z "$url" ]] && continue

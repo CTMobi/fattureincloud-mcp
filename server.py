@@ -329,12 +329,12 @@ def resolve_vat_id(vat_id):
     if isinstance(vat_id, str) and vat_id.strip().isascii() and vat_id.strip().isdigit():
         vat_id = int(vat_id)
     types = fetch_vat_types(company_id=COMPANY_ID)
-    if isinstance(vat_id, bool) or not isinstance(vat_id, int):
-        options = [(t["id"], t.get("description")) for t in types if not t.get("is_disabled")]
-        return None, f"vat_id '{vat_id}' non valido: usa un intero. Disponibili: {options}."
     if not types:
         return None, ("Impossibile leggere l'anagrafica IVA (/info/vat_types): "
                       "riprova, l'aliquota non può essere impostata senza.")
+    if isinstance(vat_id, bool) or not isinstance(vat_id, int):
+        options = [(t["id"], t.get("description")) for t in types if not t.get("is_disabled")]
+        return None, f"vat_id '{vat_id}' non valido: usa un intero. Disponibili: {options}."
     for vat_type in types:
         if vat_type.get("id") == vat_id:
             if vat_type.get("is_disabled"):
@@ -374,6 +374,11 @@ def build_items_list(items_data, negate=False):
     resolved to a vat type id, since FIC ignores the percentage in the body."""
     items_list = []
     for item in items_data:
+        for field in ("qty", "net_price"):
+            value = item.get(field)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return None, (f"La riga '{item.get('name')}' ha {field} = {value!r}: "
+                              "serve un numero, altrimenti l'importo della rata sarebbe zero.")
         if item.get("vat_id") is not None:
             vat_type, error = resolve_vat_id(item["vat_id"])
             if error:

@@ -121,8 +121,12 @@ print("\n".join(sorted(t.name for t in asyncio.run(server.list_tools()))))
         diff <(echo "$declared") <(echo "$packed") | sed 's/^/     /' >&2 || true
       elif [[ -n "$manifest_version" && "$packed_version" != "$manifest_version" ]]; then
         err "bundle is stale (packed $packed_version vs manifest $manifest_version): run ./scripts/build.sh"
-      elif [[ -z "$declared" || -z "$manifest_version" ]]; then
+      elif [[ -z "$declared" && -z "$manifest_version" ]]; then
         echo "bundled runtime:  $(wc -l <<< "$runtime") tools (v$packed_version; not compared to $MANIFEST)"
+      elif [[ -z "$manifest_version" ]]; then
+        echo "bundled runtime:  $(wc -l <<< "$runtime") tools (names match $MANIFEST; version not compared)"
+      elif [[ -z "$declared" ]]; then
+        echo "bundled runtime:  $(wc -l <<< "$runtime") tools (v$packed_version matches $MANIFEST; names not compared)"
       else
         echo "bundled runtime:  $(wc -l <<< "$runtime") tools (match manifest, v$packed_version)"
       fi

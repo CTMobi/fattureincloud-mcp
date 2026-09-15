@@ -1788,3 +1788,45 @@ def test_resolve_vat_id_type_error_lists_the_options(server_module):
     server = server_module
     _, error = server.resolve_vat_id(1.5)
     assert "22%" in error
+
+
+# --------------------------------------------------------------------------
+# review round 10
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("item", [
+    {"name": "X", "qty": 1, "net_price": None, "vat_rate": 22},
+    {"name": "X", "qty": None, "net_price": 100.0, "vat_rate": 22},
+    {"name": "X", "net_price": 100.0, "vat_rate": 22},
+    {"name": "X", "qty": 1, "net_price": "100", "vat_rate": 22},
+])
+def test_create_invoice_rejects_lines_without_usable_amounts(server_module, item):
+    """qty and net_price decide the amount: a null one produces a 0.00
+    installment and a 0 total, with nothing to signal it."""
+    server = server_module
+
+    with patch.object(server.issued_api, "create_issued_document") as create, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme", "ei_code": "A1"}):
+        result = _run(server.call_tool("create_invoice", {
+            "client_id": 5, "date": "2026-01-10", "visible_subject": "Test",
+            "items": [item],
+        }))
+
+    assert not create.called
+    payload = json.loads(result[0].text)
+    assert payload["success"] is False
+    assert "net_price" in payload["error"] or "qty" in payload["error"]
+
+
+def test_resolve_vat_id_reports_an_unreadable_registry(server_module):
+    """A type error must not present an empty registry as the list of rates."""
+    server = server_module
+    import cache as cache_mod
+    cache_mod.invalidate_all(100)
+
+    with patch.object(server.info_api, "list_vat_types", side_effect=RuntimeError("503")):
+        vat_type, error = server.resolve_vat_id(1.5)
+
+    assert vat_type is None
+    assert "anagrafica IVA" in error
+    assert "Disponibili: []" not in error

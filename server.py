@@ -306,9 +306,10 @@ def resolve_vat_type(rate):
     ]
     if not matches:
         available = sorted(
-            {(round(t["value"], 2), t.get("description")) for t in types if t.get("value") is not None}
+            {(round(t["value"], 2), t.get("description")) for t in types
+             if t.get("value") is not None and not t.get("is_disabled")}
         )
-        return None, (f"vat_rate {rate} non corrisponde a nessuna aliquota configurata. "
+        return None, (f"vat_rate {rate} non corrisponde a nessuna aliquota configurata attiva. "
                       f"Disponibili: {available}.")
     matches.sort(key=lambda t: (not t.get("default"), t.get("id") or 0))
     if len(matches) > 1 and not matches[0].get("default"):
@@ -323,8 +324,11 @@ def resolve_vat_type(rate):
 def resolve_vat_id(vat_id):
     """Look up a vat type by id. The percentage is needed for the local total,
     and the id deserves the same validation `vat_rate` gets."""
+    if isinstance(vat_id, str) and vat_id.strip().isascii() and vat_id.strip().isdigit():
+        vat_id = int(vat_id)
     if isinstance(vat_id, bool) or not isinstance(vat_id, int):
-        return None, "vat_id deve essere un intero (vedi l'elenco in list_vat_types o nel rifiuto di vat_rate)."
+        return None, ("vat_id deve essere un intero: l'elenco delle aliquote configurate "
+                      "compare nel messaggio di rifiuto di vat_rate.")
     types = fetch_vat_types(company_id=COMPANY_ID)
     if not types:
         return None, ("Impossibile leggere l'anagrafica IVA (/info/vat_types): "
@@ -335,8 +339,8 @@ def resolve_vat_id(vat_id):
                 return None, (f"vat_id {vat_id} ({vat_type.get('description')}) è disattivata "
                               "nell'anagrafica IVA: scegline una attiva.")
             return vat_type, None
-    options = [(t["id"], t.get("description")) for t in types]
-    return None, f"vat_id {vat_id} non esiste nell'anagrafica IVA. Disponibili: {options}."
+    options = [(t["id"], t.get("description")) for t in types if not t.get("is_disabled")]
+    return None, f"vat_id {vat_id} non esiste tra le aliquote attive. Disponibili: {options}."
 
 
 def build_entity_from_client(client_id, client_data=None):

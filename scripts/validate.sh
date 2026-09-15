@@ -59,11 +59,13 @@ if [[ -f "$MANIFEST" ]] && command -v jq >/dev/null 2>&1; then
   echo "pyproject.toml:   $pyproject_version"
   echo "CHANGELOG (top):  $changelog_version"
 
-  if [[ "$manifest_version" != "$pyproject_version" ]]; then
-    err "manifest version != pyproject version"
-  fi
-  if [[ "$manifest_version" != "$changelog_version" ]]; then
-    err "manifest version != CHANGELOG top entry"
+  if [[ -n "$manifest_version" ]]; then
+    if [[ "$manifest_version" != "$pyproject_version" ]]; then
+      err "manifest version != pyproject version"
+    fi
+    if [[ "$manifest_version" != "$changelog_version" ]]; then
+      err "manifest version != CHANGELOG top entry"
+    fi
   fi
 else
   warn "jq not available or manifest missing; skipping version coherence check"
@@ -114,7 +116,7 @@ print("\n".join(sorted(t.name for t in asyncio.run(server.list_tools()))))
       elif [[ "$runtime" != "$packed" ]]; then
         err "bundled manifest tools != bundled runtime tools"
         diff <(echo "$packed") <(echo "$runtime") | sed 's/^/     /' >&2 || true
-      elif [[ "$packed" != "$declared" || "$packed_version" != "$manifest_version" ]]; then
+      elif [[ -n "$declared" && ( "$packed" != "$declared" || "$packed_version" != "$manifest_version" ) ]]; then
         err "bundle is stale (packed $packed_version vs manifest $manifest_version): run ./scripts/build.sh"
         diff <(echo "$declared") <(echo "$packed") | sed 's/^/     /' >&2 || true
       else

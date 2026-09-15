@@ -1693,3 +1693,58 @@ def test_create_invoice_rejects_a_non_integer_vat_id(server_module, vat_id):
 
     assert not create.called
     assert "vat_id" in json.loads(result[0].text)["error"]
+
+
+# --------------------------------------------------------------------------
+# review round 8
+# --------------------------------------------------------------------------
+
+def _only_disabled_22():
+    response = MagicMock()
+    response.data = [_sdk_obj(v) for v in [
+        {"id": 9, "value": 22.0, "description": "22% dismessa", "is_disabled": True, "default": False},
+        {"id": 3, "value": 10.0, "description": "10%", "is_disabled": False, "default": False},
+    ]]
+    return response
+
+
+def test_resolve_vat_type_does_not_offer_disabled_rates(server_module):
+    """A rate that exists only as a disabled type is not available: listing it
+    sends the caller back to the value just refused."""
+    server = server_module
+    import cache as cache_mod
+    cache_mod.invalidate_all(100)
+
+    with patch.object(server.info_api, "list_vat_types", return_value=_only_disabled_22()):
+        vat_type, error = server.resolve_vat_type(22)
+
+    assert vat_type is None
+    assert "22% dismessa" not in error
+    assert "10%" in error
+
+
+def test_resolve_vat_id_lists_only_active_options(server_module):
+    server = server_module
+    import cache as cache_mod
+    cache_mod.invalidate_all(100)
+
+    with patch.object(server.info_api, "list_vat_types", return_value=_only_disabled_22()):
+        vat_type, error = server.resolve_vat_id(99)
+
+    assert vat_type is None
+    assert "22% dismessa" not in error
+
+
+def test_resolve_vat_id_accepts_a_numeric_string(server_module):
+    """payment_account and payment_index both take one: this is the same
+    shape of argument."""
+    server = server_module
+    vat_type, error = server.resolve_vat_id("3")
+    assert error is None
+    assert vat_type["id"] == 3
+
+
+def test_resolve_vat_id_error_does_not_name_a_missing_tool(server_module):
+    server = server_module
+    _, error = server.resolve_vat_id(1.5)
+    assert "list_vat_types" not in error

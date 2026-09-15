@@ -372,13 +372,20 @@ def build_entity_from_client(client_id, client_data=None):
 def build_items_list(items_data, negate=False):
     """Build the items payload. Returns (items, error): the VAT rate has to be
     resolved to a vat type id, since FIC ignores the percentage in the body."""
+    if not items_data:
+        return None, ("items è vuoto: il documento resterebbe senza righe, con una rata di "
+                      "importo zero, e su update_document cancellerebbe quelle esistenti.")
     items_list = []
     for item in items_data:
+        position = len(items_list)
+        for field in ("name", "qty", "net_price"):
+            if item.get(field) is None:
+                return None, f"La riga in posizione {position} non ha {field}: è obbligatorio."
         for field in ("qty", "net_price"):
-            value = item.get(field)
+            value = item[field]
             if isinstance(value, bool) or not isinstance(value, (int, float)):
-                return None, (f"La riga '{item.get('name')}' ha {field} = {value!r}: "
-                              "serve un numero, altrimenti l'importo della rata sarebbe zero.")
+                return None, (f"La riga in posizione {position} ha {field} = {value!r}: "
+                              "serve un numero.")
         if item.get("vat_id") is not None:
             vat_type, error = resolve_vat_id(item["vat_id"])
             if error:
@@ -628,7 +635,7 @@ async def list_tools():
                 "type": "object",
                 "properties": {
                     "client_id": {"type": "integer", "description": "ID cliente"},
-                    "items": {"type": "array", "items": item_schema},
+                    "items": {"type": "array", "minItems": 1, "items": item_schema},
                     "date": {"type": "string", "description": "Data YYYY-MM-DD (default: oggi)"},
                     "payment_days": {"type": "integer", "description": "Giorni pagamento (default: 30)"},
                     "visible_subject": {"type": "string", "description": "Oggetto visibile"},
@@ -645,7 +652,7 @@ async def list_tools():
                 "type": "object",
                 "properties": {
                     "client_id": {"type": "integer", "description": "ID cliente"},
-                    "items": {"type": "array", "items": item_schema},
+                    "items": {"type": "array", "minItems": 1, "items": item_schema},
                     "date": {"type": "string", "description": "Data YYYY-MM-DD (default: oggi)"},
                     "payment_days": {"type": "integer", "description": "Giorni pagamento (default: 30)"},
                     "visible_subject": {"type": "string", "description": "Oggetto visibile"},
@@ -663,7 +670,7 @@ async def list_tools():
                 "type": "object",
                 "properties": {
                     "client_id": {"type": "integer", "description": "ID cliente"},
-                    "items": {"type": "array", "items": item_schema},
+                    "items": {"type": "array", "minItems": 1, "items": item_schema},
                     "date": {"type": "string", "description": "Data YYYY-MM-DD (default: oggi)"},
                     "payment_days": {"type": "integer", "description": "Giorni pagamento (default: 30)"},
                     "visible_subject": {"type": "string", "description": "Oggetto visibile"},
@@ -700,6 +707,7 @@ async def list_tools():
                     "payment_days": {"type": "integer", "description": "Nuovi giorni pagamento (opzionale)"},
                     "items": {
                         "type": "array",
+                        "minItems": 1,
                         "items": item_schema,
                         "description": "Nuove righe documento (opzionale). Per NDC, importi sempre positivi."
                     },

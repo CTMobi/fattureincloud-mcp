@@ -1830,3 +1830,61 @@ def test_resolve_vat_id_reports_an_unreadable_registry(server_module):
     assert vat_type is None
     assert "anagrafica IVA" in error
     assert "Disponibili: []" not in error
+
+
+# --------------------------------------------------------------------------
+# review round 11
+# --------------------------------------------------------------------------
+
+def test_create_invoice_rejects_an_empty_items_list(server_module):
+    """Per-line checks do not run when there are no lines: the document would
+    be created with no rows and a 0.00 installment."""
+    server = server_module
+
+    with patch.object(server.issued_api, "create_issued_document") as create, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme", "ei_code": "A1"}):
+        result = _run(server.call_tool("create_invoice", {
+            "client_id": 5, "date": "2026-01-10", "visible_subject": "Test", "items": [],
+        }))
+
+    assert not create.called
+    assert json.loads(result[0].text)["success"] is False
+
+
+def test_update_document_rejects_an_empty_items_list(server_module):
+    """An array in the body replaces the stored one, so items=[] would delete
+    the document's lines."""
+    server = server_module
+    doc = _issued_doc([_rate(1220.0, "2026-02-09")])
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document") as modify, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme"}):
+        result = _run(server.call_tool("update_document", {
+            "document_id": 42, "items": [],
+        }))
+
+    assert not modify.called
+    assert json.loads(result[0].text)["success"] is False
+
+
+def test_create_invoice_rejects_a_line_without_name(server_module):
+    """name is required too, and the refusal must identify the line without
+    relying on the field that is missing."""
+    server = server_module
+
+    with patch.object(server.issued_api, "create_issued_document") as create, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme", "ei_code": "A1"}):
+        result = _run(server.call_tool("create_invoice", {
+            "client_id": 5, "date": "2026-01-10", "visible_subject": "Test",
+            "items": [
+                {"name": "Prima", "qty": 1, "net_price": 100.0},
+                {"qty": 1, "net_price": 50.0},
+            ],
+        }))
+
+    assert not create.called
+    error = json.loads(result[0].text)["error"]
+    assert "posizione 1" in error
+    assert "name" in error

@@ -38,6 +38,9 @@ def _ann(read_only=False, destructive=False, idempotent=False, open_world=True):
         openWorldHint=open_world,
     )
 
+# ReceivedDocumentType, from the official OpenAPI spec
+RECEIVED_DOCUMENT_TYPES = ("expense", "passive_credit_note", "passive_delivery_note", "self_invoice")
+
 ACCESS_TOKEN = os.getenv("FIC_ACCESS_TOKEN", "")
 COMPANY_ID = int(os.getenv("FIC_COMPANY_ID", "0"))
 SENDER_EMAIL = os.getenv("FIC_SENDER_EMAIL", "")
@@ -218,19 +221,73 @@ def _payment_entry(p):
     return entry
 
 
+def _payment_terms_of(doc):
+    """Stored payment terms of a document's first installment."""
+    return ((doc.get("payments_list") or [{}])[0] or {}).get("payment_terms") or {}
+
+
 def _payment_days_of(doc):
     """Payment-term days of a document's first installment. FIC can return
     `payment_terms: null` or `days: null`, and `days: 0` (rimessa diretta) is a
     real term that must survive."""
-    terms = ((doc.get("payments_list") or [{}])[0] or {}).get("payment_terms") or {}
-    days = terms.get("days")
+    days = _payment_terms_of(doc).get("days")
     return 30 if days is None else days
+
+
+def _all_pages(api_call, **kwargs):
+    """Every list endpoint caps `per_page` at 100 (OpenAPI v2.1.8), so a single
+    call is not a year of documents. Follow `last_page` instead of reporting a
+    partial total."""
+    response = api_call(per_page=100, page=1, **kwargs)
+    docs = list(response.data or [])
+    last_page = getattr(response, "last_page", 1) or 1
+    for page in range(2, last_page + 1):
+        page_response = api_call(per_page=100, page=page, **kwargs)
+        docs.extend(page_response.data or [])
+    return docs
 
 
 def _error(message, **extra):
     payload = {"success": False, "error": message}
     payload.update(extra)
     return [TextContent(type="text", text=json.dumps(payload, indent=2, ensure_ascii=False))]
+
+
+@cache.cached("vat_types", ttl=timedelta(hours=24))
+def fetch_vat_types(*, company_id):
+    """VAT types (FIC `/info/vat_types`). The spec marks `vat.value` read-only
+    on document items, so the rate is selected by `vat.id` — the percentage in
+    the payload is ignored."""
+    try:
+        response = info_api.list_vat_types(company_id=company_id)
+    except Exception:
+        return []
+    types = []
+    for v in (response.data or []):
+        d = v.to_dict() if hasattr(v, "to_dict") else dict(v)
+        types.append({
+            "id": d.get("id"),
+            "value": d.get("value"),
+            "description": d.get("description"),
+            "is_disabled": d.get("is_disabled"),
+            "default": d.get("default"),
+        })
+    return types
+
+
+def resolve_vat_type(rate):
+    """Map a percentage to a FIC vat type id. Returns (vat_type, error)."""
+    types = fetch_vat_types(company_id=COMPANY_ID)
+    if not types:
+        return None, ("Impossibile leggere l'anagrafica IVA (/info/vat_types): "
+                      "riprova, l'aliquota non può essere impostata senza.")
+    matches = [t for t in types if t.get("value") == rate and not t.get("is_disabled")]
+    if not matches:
+        available = sorted({t["value"] for t in types if t.get("value") is not None})
+        return None, (f"vat_rate {rate} non corrisponde a nessuna aliquota configurata. "
+                      f"Disponibili: {available}.")
+    matches.sort(key=lambda t: (not t.get("default"), t.get("id") or 0))
+    return matches[0], None
 
 
 def build_entity_from_client(client_id, client_data=None):
@@ -258,9 +315,13 @@ def build_entity_from_client(client_id, client_data=None):
 
 
 def build_items_list(items_data, negate=False):
+    """Build the items payload. Returns (items, error): the VAT rate has to be
+    resolved to a vat type id, since FIC ignores the percentage in the body."""
     items_list = []
     for item in items_data:
-        vat_rate = item.get("vat_rate", 22)
+        vat_type, error = resolve_vat_type(item.get("vat_rate", 22))
+        if error:
+            return None, error
         net_price = item["net_price"]
         if negate:
             net_price = -abs(net_price)
@@ -269,9 +330,24 @@ def build_items_list(items_data, negate=False):
             "description": item.get("description", ""),
             "qty": item["qty"],
             "net_price": net_price,
-            "vat": {"id": 0, "value": vat_rate}
+            # `value` is not sent (read-only): it is kept here only so the local
+            # total matches what FIC will compute from the vat type.
+            "vat": {"id": vat_type["id"]},
+            "_vat_value": vat_type.get("value") or 0,
         })
-    return items_list
+    return items_list, None
+
+
+def _vat_value(item):
+    """Percentage of an item, from the local hint or from what FIC returned."""
+    if "_vat_value" in item:
+        return item["_vat_value"] or 0
+    vat = item.get("vat") or {}
+    return vat.get("value") or 0
+
+
+def _strip_local_fields(items):
+    return [{k: v for k, v in i.items() if not k.startswith("_")} for i in items]
 
 
 def build_issued_document(doc_type, client_id, items_data, date_str, payment_days,
@@ -290,15 +366,18 @@ def build_issued_document(doc_type, client_id, items_data, date_str, payment_day
             )
 
     entity = build_entity_from_client(client_id, client_data)
-    items_list = build_items_list(items_data, negate=False)
+    items_list, items_error = build_items_list(items_data, negate=False)
+    if items_error:
+        return None, items_error
 
     invoice_date = datetime.strptime(date_str, "%Y-%m-%d")
     due_date = invoice_date + timedelta(days=payment_days)
     total_abs = sum(
-        abs(i["qty"] * i["net_price"]) * (1 + i["vat"]["value"] / 100)
+        abs(i["qty"] * i["net_price"]) * (1 + _vat_value(i) / 100)
         for i in items_list
     )
     result_total = -total_abs if negate_prices else total_abs
+    items_list = _strip_local_fields(items_list)
 
     body_data = {
         "type": doc_type,
@@ -319,8 +398,9 @@ def build_issued_document(doc_type, client_id, items_data, date_str, payment_day
     if doc_type in ("invoice", "credit_note"):
         body_data["e_invoice"] = True
         body_data["ei_data"] = {"payment_method": "MP05"}
-    if source_invoice_id:
-        body_data["original_document"] = {"id": source_invoice_id}
+    # `original_document` is not a writable field: it is absent from the spec's
+    # IssuedDocument schema and the SDK model drops it, so the link was never
+    # made. FIC links documents through /issued_documents/transform.
 
     response = issued_api.create_issued_document(
         company_id=COMPANY_ID,
@@ -343,7 +423,7 @@ def build_issued_document(doc_type, client_id, items_data, date_str, payment_day
     if revenue_center:
         result["revenue_center"] = revenue_center
     if source_invoice_id:
-        result["linked_to_invoice"] = source_invoice_id
+        result["source_invoice_id"] = source_invoice_id
     return result, None
 
 
@@ -492,7 +572,7 @@ async def list_tools():
                     "date": {"type": "string", "description": "Data YYYY-MM-DD (default: oggi)"},
                     "payment_days": {"type": "integer", "description": "Giorni pagamento (default: 30)"},
                     "visible_subject": {"type": "string", "description": "Oggetto visibile"},
-                    "source_invoice_id": {"type": "integer", "description": "ID fattura originale da stornare (opzionale)"},
+                    "source_invoice_id": {"type": "integer", "description": "ID fattura originale da stornare (opzionale). Riportato nella risposta, ma l'API non permette di creare il collegamento formale: va fatto dal pannello FIC"},
                     "revenue_center": {"type": "string", "description": "Centro di ricavo (opzionale, deve esistere — vedi list_cost_centers)"}
                 },
                 "required": ["client_id", "items"]
@@ -628,13 +708,17 @@ async def list_tools():
         ),
         Tool(
             name="list_received_documents",
-            description="Lista fatture PASSIVE (ricevute dai fornitori). Parametri: year, month (opzionale), type (opzionale: expense, credit_note)",
+            description="Lista fatture PASSIVE (ricevute dai fornitori). Parametri: year, month (opzionale), type (opzionale: expense, passive_credit_note, passive_delivery_note, self_invoice)",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "year": {"type": "integer", "description": "Anno"},
                     "month": {"type": "integer", "description": "Mese 1-12 (opzionale)"},
-                    "type": {"type": "string", "description": "Tipo: expense, credit_note (default: expense)"},
+                    "type": {
+                        "type": "string",
+                        "enum": list(RECEIVED_DOCUMENT_TYPES),
+                        "description": "Tipo: expense (default), passive_credit_note, passive_delivery_note, self_invoice"
+                    },
                     "query": {"type": "string", "description": "Filtro testuale (opzionale)"}
                 },
                 "required": ["year"]
@@ -727,13 +811,17 @@ async def list_tools():
         ),
         Tool(
             name="create_received_document",
-            description="Crea documento passivo (fattura ricevuta o NDC ricevuta) registrando una spesa. IMPORTANTE: Chiedere conferma all'utente prima di eseguire.",
+            description="Crea documento passivo (fattura ricevuta, NDC ricevuta, DDT, autofattura) registrando una spesa. IMPORTANTE: Chiedere conferma all'utente prima di eseguire.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "supplier_name": {"type": "string", "description": "Nome/Ragione sociale del fornitore"},
                     "supplier_vat_number": {"type": "string", "description": "Partita IVA del fornitore (opzionale)"},
-                    "type": {"type": "string", "description": "Tipo: expense (default) o credit_note"},
+                    "type": {
+                        "type": "string",
+                        "enum": list(RECEIVED_DOCUMENT_TYPES),
+                        "description": "Tipo: expense (default), passive_credit_note (NDC ricevuta), passive_delivery_note, self_invoice"
+                    },
                     "date": {"type": "string", "description": "Data documento YYYY-MM-DD (default: oggi)"},
                     "amount_net": {"type": "number", "description": "Importo netto"},
                     "amount_vat": {"type": "number", "description": "Importo IVA"},
@@ -827,7 +915,6 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "items": items,
                 "payments": payments,
                 "ei_status": d.get("ei_status"),
-                "original_document": d.get("original_document")
             }
             if d.get("rc_center"):
                 result["revenue_center"] = d["rc_center"]
@@ -962,8 +1049,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             if error:
                 return [TextContent(type="text", text=json.dumps({"success": False, "error": error}, ensure_ascii=False))]
             msg = f"NDC #{result['number']} creata come bozza. Totale: {result['total']}."
-            if result.get("linked_to_invoice"):
-                msg += f" Collegata a fattura ID {result['linked_to_invoice']}."
+            if result.get("source_invoice_id"):
+                msg += (f" Riferita alla fattura ID {result['source_invoice_id']}, ma il "
+                        "collegamento formale non è impostato: l'API lo consente solo "
+                        "trasformando il documento, da fare dal pannello FattureInCloud.")
             msg += " Usa send_to_sdi per inviarla."
             result["message"] = msg
             return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
@@ -1006,19 +1095,16 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
             items_list = []
             for i in orig.get("items_list", []):
-                items_list.append({
-                    "name": i.get("name", ""),
-                    "description": i.get("description", ""),
-                    "qty": i.get("qty"),
-                    "net_price": abs(i.get("net_price", 0)),
-                    "vat": {"id": 0, "value": i.get("vat", {}).get("value", 22)}
-                })
+                item = {k: v for k, v in i.items() if v is not None and k != "id"}
+                item["net_price"] = abs(item.get("net_price", 0))
+                items_list.append(item)
 
             payment_days = _payment_days_of(orig)
+            payment_terms_type = _enum_value(_payment_terms_of(orig).get("type")) or "standard"
 
             invoice_date = datetime.strptime(date_str[:10], "%Y-%m-%d")
             due_date = invoice_date + timedelta(days=payment_days)
-            total_gross = sum(i["qty"] * i["net_price"] * (1 + i["vat"]["value"] / 100) for i in items_list)
+            total_gross = sum((i.get("qty") or 0) * (i.get("net_price") or 0) * (1 + _vat_value(i) / 100) for i in items_list)
 
             revenue_center = arguments.get("revenue_center") or orig.get("rc_center")
             if revenue_center:
@@ -1041,7 +1127,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     "amount": round(total_gross, 2),
                     "due_date": due_date.strftime("%Y-%m-%d"),
                     "status": "not_paid",
-                    "payment_terms": {"days": payment_days, "type": "standard"}
+                    "payment_terms": {"days": payment_days, "type": payment_terms_type}
                 }]
             }
             if revenue_center:
@@ -1094,28 +1180,31 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             visible_subject = arguments.get("visible_subject") if "visible_subject" in arguments else (orig.get("visible_subject") or "")
 
             if "items" in arguments:
-                items_list = build_items_list(arguments["items"], negate=False)
+                items_list, items_error = build_items_list(arguments["items"], negate=False)
+                if items_error:
+                    return _error(items_error)
             else:
+                # The body replaces the stored array, so echo each item as it
+                # came back — product_id, discount, apply_withholding_taxes and
+                # the vat type id all have to survive an unrelated edit.
                 items_list = []
                 for i in orig.get("items_list", []):
-                    items_list.append({
-                        "name": i.get("name", ""),
-                        "description": i.get("description", ""),
-                        "qty": i.get("qty"),
-                        "net_price": abs(i.get("net_price", 0)),
-                        "vat": {"id": 0, "value": i.get("vat", {}).get("value", 22)}
-                    })
+                    item = {k: v for k, v in i.items() if v is not None}
+                    item["net_price"] = abs(item.get("net_price", 0))
+                    items_list.append(item)
 
             orig_days = _payment_days_of(orig)
             payment_days = orig_days if arguments.get("payment_days") is None else arguments["payment_days"]
+            payment_terms_type = _enum_value(_payment_terms_of(orig).get("type")) or "standard"
 
             invoice_date = datetime.strptime(date_str[:10], "%Y-%m-%d")
             due_date = invoice_date + timedelta(days=payment_days)
             total_abs = sum(
-                abs(i["qty"] * i["net_price"]) * (1 + i["vat"]["value"] / 100)
+                abs((i.get("qty") or 0) * (i.get("net_price") or 0)) * (1 + _vat_value(i) / 100)
                 for i in items_list
             )
             result_total = -total_abs if is_credit_note else total_abs
+            items_list = _strip_local_fields(items_list)
 
             client_id = orig.get("entity", {}).get("id")
             client_data = get_client_by_id(client_id) if client_id else None
@@ -1182,14 +1271,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 # single settled installment, same total: only the due date moves
                 payment = dict(existing_payments[0])
                 payment["due_date"] = due_date.strftime("%Y-%m-%d")
-                payment["payment_terms"] = {"days": payment_days, "type": "standard"}
+                payment["payment_terms"] = {"days": payment_days, "type": payment_terms_type}
                 payments_list = [payment]
             else:
                 payments_list = [{
                     "amount": round(total_abs, 2),
                     "due_date": due_date.strftime("%Y-%m-%d"),
                     "status": "not_paid",
-                    "payment_terms": {"days": payment_days, "type": "standard"}
+                    "payment_terms": {"days": payment_days, "type": payment_terms_type}
                 }]
 
             body_data = {
@@ -1205,10 +1294,19 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             if orig.get("show_totals"):
                 body_data["show_totals"] = _enum_value(orig["show_totals"])
             if doc_type in ("invoice", "credit_note"):
-                body_data["e_invoice"] = True
-                body_data["ei_data"] = {"payment_method": "MP05"}
-            if orig.get("original_document"):
-                body_data["original_document"] = orig["original_document"]
+                # `ei_data` applies only to e-invoices, and the payment method is
+                # the document's own: overwriting it with MP05 on an unrelated
+                # edit would change what the XML declares.
+                body_data["e_invoice"] = bool(orig.get("e_invoice"))
+                if body_data["e_invoice"]:
+                    ei_data = dict(orig.get("ei_data") or {})
+                    payment_method = (
+                        ei_data.get("payment_method")
+                        or (orig.get("payment_method") or {}).get("ei_payment_method")
+                        or "MP05"
+                    )
+                    ei_data["payment_method"] = payment_method
+                    body_data["ei_data"] = ei_data
 
             response = issued_api.modify_issued_document(
                 company_id=COMPANY_ID,
@@ -1255,11 +1353,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 if desc_replace.get("old") and desc_replace.get("new"):
                     iname = iname.replace(desc_replace["old"], desc_replace["new"])
                     idesc = idesc.replace(desc_replace["old"], desc_replace["new"])
-                items_list.append({
-                    "name": iname, "description": idesc,
-                    "qty": i.get("qty"), "net_price": i.get("net_price"),
-                    "vat": {"id": 0, "value": i.get("vat", {}).get("value", 22)}
-                })
+                item = {k: v for k, v in i.items() if v is not None and k != "id"}
+                item["name"] = iname
+                item["description"] = idesc
+                items_list.append(item)
 
             visible_subject = orig.get("visible_subject", "")
             if desc_replace.get("old") and desc_replace.get("new"):
@@ -1270,9 +1367,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 payment_days = payment_days_override
             else:
                 payment_days = _payment_days_of(orig)
+            payment_terms_type = _enum_value(_payment_terms_of(orig).get("type")) or "standard"
 
             due_date = invoice_date + timedelta(days=payment_days)
-            total_gross = sum(i["qty"] * i["net_price"] * (1 + i["vat"]["value"] / 100) for i in items_list)
+            total_gross = sum((i.get("qty") or 0) * (i.get("net_price") or 0) * (1 + _vat_value(i) / 100) for i in items_list)
 
             revenue_center = arguments.get("revenue_center") or orig.get("rc_center")
             if revenue_center:
@@ -1445,17 +1543,19 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             client_filter = (arguments.get("client_name") or "").lower().strip()
             q = f"date >= '{year}-01-01' and date <= '{year}-12-31'"
 
-            emesse_resp = issued_api.list_issued_documents(
-                company_id=COMPANY_ID, type="invoice", q=q, per_page=100, fieldset="detailed"
+            emesse = _all_pages(
+                issued_api.list_issued_documents,
+                company_id=COMPANY_ID, type="invoice", q=q, fieldset="detailed"
             )
-            ndc_resp = issued_api.list_issued_documents(
-                company_id=COMPANY_ID, type="credit_note", q=q, per_page=100, fieldset="detailed"
+            note_credito = _all_pages(
+                issued_api.list_issued_documents,
+                company_id=COMPANY_ID, type="credit_note", q=q, fieldset="detailed"
             )
 
             totale_fatturato = totale_incassato = totale_ndc = 0
             fatture_non_pagate = []
 
-            for doc in (emesse_resp.data or []):
+            for doc in emesse:
                 d = doc.to_dict()
                 client_name = d.get('entity', {}).get('name', '') if d.get('entity') else ''
                 if client_filter and client_filter not in client_name.lower():
@@ -1473,7 +1573,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                             "due_date": str(p.get('due_date', ''))
                         })
 
-            for doc in (ndc_resp.data or []):
+            for doc in note_credito:
                 d = doc.to_dict()
                 client_name = d.get('entity', {}).get('name', '') if d.get('entity') else ''
                 if client_filter and client_filter not in client_name.lower():
@@ -1484,12 +1584,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
             totale_costi = 0
             if not client_filter:
-                ricevute_resp = received_api.list_received_documents(
-                    company_id=COMPANY_ID, type="expense", q=q, per_page=100, fieldset="detailed"
+                ricevute = _all_pages(
+                    received_api.list_received_documents,
+                    company_id=COMPANY_ID, type="expense", q=q, fieldset="detailed"
                 )
                 totale_costi = sum(
                     d.to_dict().get('amount_gross') or d.to_dict().get('amount_net') or 0
-                    for d in (ricevute_resp.data or [])
+                    for d in ricevute
                 )
 
             fatture_non_pagate.sort(key=lambda x: x.get('due_date', ''))
@@ -1790,6 +1891,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     }, ensure_ascii=False))]
 
             doc_type = arguments.get("type", "expense")
+            # ReceivedDocumentType has no `credit_note`: the passive one is
+            # `passive_credit_note`. Keep the old spelling working as an alias.
+            doc_type = {"credit_note": "passive_credit_note"}.get(doc_type, doc_type)
+            if doc_type not in RECEIVED_DOCUMENT_TYPES:
+                return _error(
+                    f"type '{arguments.get('type')}' non valido. "
+                    f"Ammessi: {sorted(RECEIVED_DOCUMENT_TYPES)}."
+                )
             date_str = arguments.get("date", datetime.now().strftime("%Y-%m-%d"))
             amount_net = arguments["amount_net"]
             amount_vat = arguments.get("amount_vat", 0)

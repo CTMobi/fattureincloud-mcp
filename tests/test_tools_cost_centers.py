@@ -29,6 +29,16 @@ def server_module(tmp_path, monkeypatch):
     yield server
 
 
+def _vat_types():
+    """The VAT registry backs every document write: vat.value is read-only in
+    the API, so the rate is resolved to a vat type id before sending."""
+    response = MagicMock()
+    vat_type = MagicMock()
+    vat_type.to_dict.return_value = {"id": 0, "value": 22.0, "is_disabled": False, "default": True}
+    response.data = [vat_type]
+    return response
+
+
 def _mock_response(centers):
     response = MagicMock()
     response.data = list(centers) if centers is not None else None
@@ -147,6 +157,7 @@ def test_revenue_center_validation_against_revenue_list_only(server_module):
     with patch.object(server.info_api, "list_cost_centers", return_value=cost_resp), \
          patch.object(server.info_api, "list_revenue_centers", return_value=rev_resp), \
          patch.object(server.clients_api, "get_client", return_value=fake_client), \
+         patch.object(server.info_api, "list_vat_types", return_value=_vat_types()), \
          patch.object(server.issued_api, "create_issued_document", return_value=created):
         good = asyncio.run(server.call_tool("create_invoice", {
             "client_id": 5,

@@ -126,7 +126,7 @@ Claude will:
 
 ## Caching
 
-To minimize redundant calls to the FattureInCloud API, this server caches client lookups, the cost-centers list and the payment accounts locally as JSON files (default location `~/.fattureincloud-mcp/cache/`, scoped per `company_id`, 24-hour TTL). The cache is transparent: tool signatures don't change.
+To minimize redundant calls to the FattureInCloud API, this server caches client lookups, the cost-centers list, the payment accounts and the VAT registry locally as JSON files (default location `~/.fattureincloud-mcp/cache/`, scoped per `company_id`, 24-hour TTL). The cache is transparent: tool signatures don't change.
 
 ```bash
 # Force refresh:

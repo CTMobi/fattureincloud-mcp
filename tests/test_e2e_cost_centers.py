@@ -60,8 +60,14 @@ def server_module(tmp_path, monkeypatch):
         "certified_email": "",
     }
 
+    vat_response = MagicMock()
+    vat_type = MagicMock()
+    vat_type.to_dict.return_value = {"id": 0, "value": 22.0, "is_disabled": False, "default": True}
+    vat_response.data = [vat_type]
+
     with patch.object(server.info_api, "list_cost_centers", return_value=list_cc_response), \
          patch.object(server.info_api, "list_revenue_centers", return_value=list_rc_response), \
+         patch.object(server.info_api, "list_vat_types", return_value=vat_response), \
          patch.object(server.clients_api, "get_client", return_value=client_response):
         yield server
 

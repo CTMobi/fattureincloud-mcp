@@ -24,6 +24,12 @@ from fattureincloud_python_sdk.models.modify_issued_document_request import Modi
 from fattureincloud_python_sdk.models.received_document import ReceivedDocument
 
 
+VAT_TYPES = [
+    {"id": 0, "value": 22.0, "description": "22%", "is_disabled": False, "default": True},
+    {"id": 3, "value": 10.0, "description": "10%", "is_disabled": False, "default": False},
+    {"id": 6, "value": 0.0, "description": "Non imponibile", "is_disabled": False, "default": False},
+]
+
 ACCOUNTS = [
     {"id": 110, "name": "Banca Intesa", "type": "standard", "virtual": False},
     {"id": 111, "name": "Cassa contanti", "type": "standard", "virtual": False},
@@ -45,8 +51,16 @@ def server_module(tmp_path, monkeypatch):
     server = importlib.import_module("server")
 
     with patch.object(server.info_api, "list_payment_accounts",
-                      return_value=_accounts_response(ACCOUNTS)):
+                      return_value=_accounts_response(ACCOUNTS)), \
+         patch.object(server.info_api, "list_vat_types",
+                      return_value=_vat_types_response()):
         yield server
+
+
+def _vat_types_response():
+    response = MagicMock()
+    response.data = [_sdk_obj(v) for v in VAT_TYPES]
+    return response
 
 
 def _accounts_response(accounts):
@@ -938,6 +952,8 @@ def test_update_document_on_sdk_shaped_credit_note(server_module):
     server = server_module
     payload = _issued_doc([_rate(1220.0, "2026-02-09")])
     payload["type"] = "credit_note"
+    payload["e_invoice"] = True
+    payload["ei_data"] = {"payment_method": "MP05"}
     doc = _sdk_shaped(payload)
 
     with patch.object(server.issued_api, "get_issued_document",
@@ -1221,3 +1237,194 @@ def test_set_payment_does_not_warn_on_a_normal_response(server_module):
         }))
 
     assert "warning" not in json.loads(result[0].text)
+
+
+# --------------------------------------------------------------------------
+# conformance with the official OpenAPI spec
+# --------------------------------------------------------------------------
+
+def test_update_document_preserves_end_of_month_terms(server_module):
+    """payment_terms.type is an enum with end_of_month in it: rebuilding an
+    installment must not silently convert a fine-mese schedule."""
+    server = server_module
+    doc = _issued_doc([_rate(1220.0, "2026-02-28",
+                             payment_terms={"days": 0, "type": "end_of_month"})])
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document",
+                      return_value=_doc_response(doc)) as modify, \
+         patch.object(server.info_api, "list_vat_types", return_value=_vat_types_response()), \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme"}):
+        _run(server.call_tool("update_document", {
+            "document_id": 42,
+            "items": [{"name": "Item", "qty": 1, "net_price": 2000.0, "vat_rate": 22}],
+        }))
+
+    sent = _sent_payments(modify, "modify_issued_document_request")
+    assert sent[0]["payment_terms"]["type"] == "end_of_month"
+
+
+def test_update_document_preserves_stored_item_fields(server_module):
+    """vat.value is read-only — vat.id selects the rate — and an array in the
+    body replaces the stored one, so an echoed item must keep its own fields."""
+    server = server_module
+    doc = _issued_doc([_rate(1220.0, "2026-02-09")])
+    doc["items_list"] = [{
+        "id": 77, "product_id": 5, "code": "TV3", "name": "Item",
+        "description": "", "qty": 1, "net_price": 1000.0, "discount": 10.0,
+        "apply_withholding_taxes": True,
+        "vat": {"id": 3, "value": 10.0},
+    }]
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document",
+                      return_value=_doc_response(doc)) as modify, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme"}):
+        _run(server.call_tool("update_document", {
+            "document_id": 42, "visible_subject": "Nuovo",
+        }))
+
+    item = _sent_data(modify, "modify_issued_document_request")["items_list"][0]
+    assert item["vat"]["id"] == 3
+    assert item["product_id"] == 5
+    assert item["discount"] == 10.0
+    assert item["apply_withholding_taxes"] is True
+    assert item["id"] == 77
+
+
+def test_create_invoice_resolves_vat_rate_to_a_vat_type_id(server_module):
+    """vat.value is read-only, so the rate only takes effect through vat.id."""
+    server = server_module
+    created = MagicMock()
+    created.data.to_dict.return_value = {"id": 1, "number": 1, "date": "2026-01-10"}
+
+    with patch.object(server.info_api, "list_vat_types", return_value=_vat_types_response()), \
+         patch.object(server.issued_api, "create_issued_document", return_value=created) as create, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme", "ei_code": "ABC1234"}):
+        _run(server.call_tool("create_invoice", {
+            "client_id": 5, "date": "2026-01-10", "visible_subject": "Test",
+            "items": [{"name": "Item", "qty": 1, "net_price": 100.0, "vat_rate": 10}],
+        }))
+
+    item = create.call_args.kwargs["create_issued_document_request"]["data"]["items_list"][0]
+    assert item["vat"] == {"id": 3}
+
+
+def test_create_invoice_rejects_a_vat_rate_with_no_vat_type(server_module):
+    server = server_module
+
+    with patch.object(server.info_api, "list_vat_types", return_value=_vat_types_response()), \
+         patch.object(server.issued_api, "create_issued_document") as create, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme", "ei_code": "ABC1234"}):
+        result = _run(server.call_tool("create_invoice", {
+            "client_id": 5, "date": "2026-01-10", "visible_subject": "Test",
+            "items": [{"name": "Item", "qty": 1, "net_price": 100.0, "vat_rate": 7}],
+        }))
+
+    assert not create.called
+    payload = json.loads(result[0].text)
+    assert payload["success"] is False
+    assert "vat_rate" in payload["error"]
+
+
+def test_update_document_preserves_e_invoice_and_payment_method(server_module):
+    server = server_module
+    doc = _issued_doc([_rate(1220.0, "2026-02-09")])
+    doc["e_invoice"] = False
+    doc["ei_data"] = {"payment_method": "MP08"}
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document",
+                      return_value=_doc_response(doc)) as modify, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme"}):
+        _run(server.call_tool("update_document", {
+            "document_id": 42, "visible_subject": "Nuovo",
+        }))
+
+    data = _sent_data(modify, "modify_issued_document_request")
+    assert data["e_invoice"] is False
+    assert "ei_data" not in data
+
+
+def test_update_document_keeps_the_stored_payment_method(server_module):
+    server = server_module
+    doc = _issued_doc([_rate(1220.0, "2026-02-09")])
+    doc["e_invoice"] = True
+    doc["ei_data"] = {"payment_method": "MP08"}
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document",
+                      return_value=_doc_response(doc)) as modify, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme"}):
+        _run(server.call_tool("update_document", {
+            "document_id": 42, "visible_subject": "Nuovo",
+        }))
+
+    assert _sent_data(modify, "modify_issued_document_request")["ei_data"]["payment_method"] == "MP08"
+
+
+def test_get_situation_reads_every_page(server_module):
+    """per_page maxes out at 100 (fic-openapi.yaml:5733): a year with more
+    documents than that must not silently report a partial total."""
+    server = server_module
+
+    def _page(docs, last_page):
+        response = MagicMock()
+        response.data = [MagicMock(**{"to_dict.return_value": d}) for d in docs]
+        response.last_page = last_page
+        return response
+
+    first = _page([_issued_doc([_rate(1000.0, "2026-02-09", "paid")])], 2)
+    second = _page([_issued_doc([_rate(500.0, "2026-03-09", "paid")])], 2)
+    empty = _page([], 1)
+
+    with patch.object(server.issued_api, "list_issued_documents",
+                      side_effect=[first, second, empty]) as listed, \
+         patch.object(server.received_api, "list_received_documents", return_value=empty):
+        result = _run(server.call_tool("get_situation", {"year": 2026}))
+
+    assert listed.call_args_list[1].kwargs["page"] == 2
+    assert json.loads(result[0].text)["incassato"] == 1500.0
+
+
+def test_create_received_document_maps_the_credit_note_alias(server_module):
+    """ReceivedDocumentType has no credit_note: the passive one is
+    passive_credit_note (fic-enriched.yaml:8080-8089)."""
+    server = server_module
+    created = MagicMock()
+    created.data.to_dict.return_value = {"id": 9, "type": "passive_credit_note", "date": "2026-01-10"}
+
+    with patch.object(server.received_api, "create_received_document",
+                      return_value=created) as create:
+        _run(server.call_tool("create_received_document", {
+            "supplier_name": "Supplier Srl", "amount_net": 500.0, "type": "credit_note",
+        }))
+
+    assert create.call_args.kwargs["create_received_document_request"]["data"]["type"] == "passive_credit_note"
+
+
+def test_create_credit_note_does_not_claim_a_link_it_cannot_make(server_module):
+    """`original_document` is not a writable field: the SDK drops it and the
+    spec links documents through /issued_documents/transform instead."""
+    server = server_module
+    created = MagicMock()
+    created.data.to_dict.return_value = {"id": 2, "number": 3, "date": "2026-01-10"}
+
+    with patch.object(server.issued_api, "create_issued_document", return_value=created) as create, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme", "ei_code": "ABC1234"}):
+        result = _run(server.call_tool("create_credit_note", {
+            "client_id": 5, "date": "2026-01-10", "visible_subject": "Storno",
+            "items": [{"name": "Item", "qty": 1, "net_price": 100.0, "vat_rate": 22}],
+            "source_invoice_id": 41,
+        }))
+
+    body = create.call_args.kwargs["create_issued_document_request"]["data"]
+    assert "original_document" not in body
+    payload = json.loads(result[0].text)
+    assert payload["success"] is True
+    assert "41" in payload["message"]
+    assert "collegamento" in payload["message"].lower()

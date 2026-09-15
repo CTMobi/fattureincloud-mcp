@@ -65,31 +65,39 @@ else
   warn "jq not available or manifest missing; skipping version coherence check"
 fi
 
-# 3. Tool coherence: the manifest must match what the bundled server really
-#    serves. Importing server.py from lib/ is also the cheapest check that the
-#    bundle starts at all — a dependency that breaks the entry point (as mcp 2.x
-#    did) shows up here instead of at the user's first launch.
+# 3. Tool coherence: the manifest must match the tools the PACKED server really
+#    serves. Running from the extracted bundle is also the cheapest check that it
+#    starts at all — a dependency that breaks the entry point (as mcp 2.x did)
+#    shows up here instead of at the user's first launch.
 if [[ -f "$MANIFEST" ]] && command -v jq >/dev/null 2>&1; then
-  declared=$(jq -r '.tools[].name' "$MANIFEST" | sort)
+  declared=$(jq -r '.tools[].name' "$MANIFEST" | LC_ALL=C sort)
   echo "manifest declares $(wc -l <<< "$declared") tools"
 
-  if [[ ! -d lib ]]; then
-    warn "lib/ not built; skipping runtime tool check (run ./scripts/build.sh)"
-  elif ! command -v python3 >/dev/null 2>&1; then
-    warn "python3 not available; skipping runtime tool check"
+  if [[ ! -f "$BUNDLE" ]]; then
+    warn "no bundle to inspect; skipping runtime tool check (run ./scripts/build.sh)"
+  elif ! command -v unzip >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+    warn "unzip or python3 missing; skipping runtime tool check"
   else
-    runtime=$(PYTHONPATH=lib FIC_ACCESS_TOKEN=validate FIC_COMPANY_ID=0 python3 -c '
+    staging=$(mktemp -d)
+    trap 'rm -rf "$staging"' EXIT
+    unzip -qq "$BUNDLE" -d "$staging"
+
+    # cwd is the extracted bundle, so `import server` resolves the packed file
+    # and PYTHONPATH=lib its packed dependencies.
+    runtime=$(cd "$staging" && PYTHONPATH=lib FIC_ACCESS_TOKEN=validate FIC_COMPANY_ID=0 \
+      python3 -c '
 import asyncio, server
 print("\n".join(sorted(t.name for t in asyncio.run(server.list_tools()))))
-' 2>/dev/null) || runtime=""
+' 2>"$staging/import.err") || runtime=""
 
     if [[ -z "$runtime" ]]; then
-      err "server.py did not start from lib/ (the bundle would fail at launch)"
+      err "the bundled server.py did not start (the extension would fail at launch)"
+      sed 's/^/     /' "$staging/import.err" >&2 || true
     elif [[ "$runtime" != "$declared" ]]; then
-      err "manifest tools != runtime tools"
+      err "manifest tools != bundled runtime tools"
       diff <(echo "$declared") <(echo "$runtime") | sed 's/^/     /' >&2 || true
     else
-      echo "runtime tools:    $(wc -l <<< "$runtime") (match manifest)"
+      echo "bundled runtime:  $(wc -l <<< "$runtime") tools (match manifest)"
     fi
   fi
 fi

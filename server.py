@@ -1107,7 +1107,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     })
 
             orig_days = _payment_days_of(orig)
-            payment_days = arguments.get("payment_days", orig_days)
+            payment_days = orig_days if arguments.get("payment_days") is None else arguments["payment_days"]
 
             invoice_date = datetime.strptime(date_str[:10], "%Y-%m-%d")
             due_date = invoice_date + timedelta(days=payment_days)
@@ -1151,18 +1151,27 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             if existing_payments and not (schedule_moved or total_moved):
                 payments_list = existing_payments
             elif (registered and total_moved) or len(existing_payments) > 1:
-                reason = (
-                    f"ha {len(registered)} rata/e con pagamento registrato: modificarne importo "
-                    f"o scadenze riscriverebbe un incasso già contabilizzato "
-                    f"(totale ricalcolato {round(total_abs, 2)}, somma rate {existing_total})"
-                    if registered else
-                    f"ha un piano di {len(existing_payments)} rate: ricostruirlo lo ridurrebbe "
-                    "a un'unica scadenza, perdendo la rateizzazione"
+                if registered:
+                    reason = (
+                        f"ha {len(registered)} rata/e con pagamento registrato: modificarne "
+                        "importo o scadenze riscriverebbe un incasso già contabilizzato"
+                    )
+                    if total_moved:
+                        reason += (f" (totale ricalcolato {round(total_abs, 2)}, "
+                                   f"somma rate {abs(existing_total)})")
+                else:
+                    reason = (f"ha un piano di {len(existing_payments)} rate: ricostruirlo lo "
+                              "ridurrebbe a un'unica scadenza, perdendo la rateizzazione")
+                # clearing the payment only unblocks a single-installment document:
+                # with a plan, len(existing_payments) > 1 refuses it again.
+                recovery = (
+                    "Azzera prima il pagamento con set_payment (status='not_paid') e ripeti, "
+                    "oppure modifica il documento dal pannello FattureInCloud."
+                    if registered and len(existing_payments) == 1 else
+                    "Il piano rate va modificato dal pannello FattureInCloud."
                 )
                 return _error(
-                    f"Il documento {reason}. "
-                    "Azzera prima il pagamento con set_payment (status='not_paid'), oppure "
-                    "modifica il documento dal pannello FattureInCloud.",
+                    f"Il documento {reason}. {recovery}",
                     payments=[
                         {"index": i, "amount": p.get("amount"), "due_date": p.get("due_date"),
                          "status": p.get("status")}
@@ -1561,13 +1570,15 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             if status not in ("paid", "not_paid"):
                 return _error("status deve essere 'paid' o 'not_paid'.")
 
-            paid_date = (arguments.get("paid_date") or datetime.now().strftime("%Y-%m-%d"))[:10]
-            try:
-                datetime.strptime(paid_date, "%Y-%m-%d")
-            except ValueError:
-                return _error(
-                    f"paid_date '{arguments.get('paid_date')}' non valida: usa il formato YYYY-MM-DD."
-                )
+            paid_date = datetime.now().strftime("%Y-%m-%d")
+            if status == "paid" and arguments.get("paid_date") is not None:
+                paid_date = str(arguments["paid_date"]).strip()
+                try:
+                    datetime.strptime(paid_date, "%Y-%m-%d")
+                except ValueError:
+                    return _error(
+                        f"paid_date '{arguments['paid_date']}' non valida: usa il formato YYYY-MM-DD."
+                    )
 
             account = None
             if status == "paid" and arguments.get("payment_account") is not None:
@@ -1617,10 +1628,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             elif isinstance(index, str) and index.strip().lower() == "all":
                 targets = list(range(len(payments)))
             else:
-                try:
-                    wanted = int(index)
-                except (TypeError, ValueError):
+                if isinstance(index, bool) or not (
+                    isinstance(index, int)
+                    or (isinstance(index, str) and index.strip().lstrip("-").isdigit())
+                ):
                     return _error('payment_index deve essere un intero oppure "all".')
+                wanted = int(index)
                 if not 0 <= wanted <= last:
                     return _error(
                         f"payment_index {index} fuori intervallo: il documento ha "
@@ -1633,7 +1646,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 entry["status"] = status
                 if status == "paid":
                     # replaying the call must not move an already registered payment
-                    if arguments.get("paid_date") or not entry.get("paid_date"):
+                    if arguments.get("paid_date") is not None or not entry.get("paid_date"):
                         entry["paid_date"] = paid_date
                     if account:
                         entry["payment_account"] = {"id": account["id"]}

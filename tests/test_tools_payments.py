@@ -1028,3 +1028,138 @@ def test_update_document_refusal_names_both_totals(server_module):
 
     error = json.loads(result[0].text)["error"]
     assert "2440.0" in error and "1220.0" in error
+
+
+# --------------------------------------------------------------------------
+# review round 4
+# --------------------------------------------------------------------------
+
+def test_update_document_accepts_null_payment_days(server_module):
+    """A client sending payment_days: null must not reach timedelta()."""
+    server = server_module
+    doc = _issued_doc([_rate(1220.0, "2026-02-09")])
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document",
+                      return_value=_doc_response(doc)) as modify, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme"}):
+        result = _run(server.call_tool("update_document", {
+            "document_id": 42, "visible_subject": "Nuovo", "payment_days": None,
+        }))
+
+    assert modify.called
+    assert json.loads(result[0].text)["success"] is True
+
+
+def test_update_document_refusal_points_at_the_panel_for_installment_plans(server_module):
+    """Clearing the payment does not unblock a multi-installment document, so
+    the message must not suggest it."""
+    server = server_module
+    doc = _issued_doc([
+        _rate(610.0, "2026-01-31", "paid", paid_date="2026-01-30"),
+        _rate(610.0, "2026-02-28"),
+    ])
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document"), \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme"}):
+        result = _run(server.call_tool("update_document", {
+            "document_id": 42, "payment_days": 60,
+        }))
+
+    error = json.loads(result[0].text)["error"]
+    assert "pannello" in error
+    assert "set_payment" not in error
+    # the total did not change: claiming it did would be the wrong justification
+    assert "totale ricalcolato" not in error
+
+
+def test_update_document_refusal_reports_magnitudes_on_a_credit_note(server_module):
+    server = server_module
+    doc = _issued_doc([_rate(-1220.0, "2026-02-09", "paid", paid_date="2026-02-05")])
+    doc["type"] = "credit_note"
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document"), \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme"}):
+        result = _run(server.call_tool("update_document", {
+            "document_id": 42,
+            "items": [{"name": "Item", "qty": 1, "net_price": 2000.0, "vat_rate": 22}],
+        }))
+
+    error = json.loads(result[0].text)["error"]
+    assert "set_payment" in error
+    assert "2440.0" in error and "1220.0" in error
+    assert "-1220.0" not in error
+
+
+def test_set_payment_not_paid_ignores_a_stale_paid_date(server_module):
+    """paid_date is documented as ignored for not_paid: it must not block the
+    call that clears the payment."""
+    server = server_module
+    doc = _issued_doc([_rate(1220.0, "2026-02-09", "paid", paid_date="2026-02-05")])
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document",
+                      return_value=_doc_response(doc)) as modify:
+        result = _run(server.call_tool("set_payment", {
+            "document_id": 42, "document_type": "issued", "status": "not_paid",
+            "paid_date": "05/02/2026",
+        }))
+
+    assert modify.called
+    assert json.loads(result[0].text)["success"] is True
+
+
+def test_set_payment_rejects_a_date_that_only_looks_valid_once_truncated(server_module):
+    server = server_module
+
+    with patch.object(server.issued_api, "get_issued_document") as get_doc:
+        result = _run(server.call_tool("set_payment", {
+            "document_id": 42, "document_type": "issued", "status": "paid",
+            "paid_date": "2026-02-05junk",
+        }))
+
+    assert not get_doc.called
+    assert json.loads(result[0].text)["success"] is False
+
+
+def test_set_payment_rejects_non_string_paid_date(server_module):
+    server = server_module
+
+    with patch.object(server.issued_api, "get_issued_document") as get_doc:
+        result = _run(server.call_tool("set_payment", {
+            "document_id": 42, "document_type": "issued", "status": "paid",
+            "paid_date": 20260205,
+        }))
+
+    assert not get_doc.called
+    payload = json.loads(result[0].text)
+    assert payload["success"] is False
+    assert "paid_date" in payload["error"]
+
+
+@pytest.mark.parametrize("index", [1.9, True])
+def test_set_payment_rejects_non_integer_payment_index(server_module, index):
+    """A money mutation must not round or coerce its way to a different
+    installment."""
+    server = server_module
+    doc = _issued_doc([
+        _rate(610.0, "2026-01-31"),
+        _rate(610.0, "2026-02-28"),
+    ])
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document") as modify:
+        result = _run(server.call_tool("set_payment", {
+            "document_id": 42, "document_type": "issued", "status": "paid",
+            "payment_index": index,
+        }))
+
+    assert not modify.called
+    assert "payment_index" in json.loads(result[0].text)["error"]

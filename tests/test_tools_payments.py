@@ -1748,3 +1748,43 @@ def test_resolve_vat_id_error_does_not_name_a_missing_tool(server_module):
     server = server_module
     _, error = server.resolve_vat_id(1.5)
     assert "list_vat_types" not in error
+
+
+# --------------------------------------------------------------------------
+# review round 9
+# --------------------------------------------------------------------------
+
+def test_create_invoice_treats_a_null_vat_rate_as_absent(server_module):
+    """Clients echo back the fields they just read, nulls included."""
+    server = server_module
+    created = MagicMock()
+    created.data.to_dict.return_value = {"id": 1, "number": 1, "date": "2026-01-10"}
+
+    with patch.object(server.issued_api, "create_issued_document", return_value=created) as create, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme", "ei_code": "A1"}):
+        result = _run(server.call_tool("create_invoice", {
+            "client_id": 5, "date": "2026-01-10", "visible_subject": "Test",
+            "items": [{"name": "Item", "qty": 1, "net_price": 100.0, "vat_rate": None}],
+        }))
+
+    assert json.loads(result[0].text)["success"] is True
+    item = create.call_args.kwargs["create_issued_document_request"]["data"]["items_list"][0]
+    assert item["vat"] == {"id": 0}
+
+
+@pytest.mark.parametrize("rate", ["22", True])
+def test_resolve_vat_type_rejects_a_non_numeric_rate(server_module, rate):
+    """round() on a string or a bool would reach the model as a stacktrace —
+    and round(True, 2) is 1, i.e. a 1% line."""
+    server = server_module
+    vat_type, error = server.resolve_vat_type(rate)
+    assert vat_type is None
+    assert "vat_rate" in error
+
+
+def test_resolve_vat_id_type_error_lists_the_options(server_module):
+    """The other two refusals list them inline; this one pointed at a message
+    a first-try mistake has never seen."""
+    server = server_module
+    _, error = server.resolve_vat_id(1.5)
+    assert "22%" in error

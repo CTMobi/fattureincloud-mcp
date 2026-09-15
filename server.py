@@ -295,6 +295,8 @@ def fetch_vat_types(*, company_id):
 
 def resolve_vat_type(rate):
     """Map a percentage to a FIC vat type id. Returns (vat_type, error)."""
+    if isinstance(rate, bool) or not isinstance(rate, (int, float)):
+        return None, f"vat_rate '{rate}' non valido: usa un numero (es. 22)."
     types = fetch_vat_types(company_id=COMPANY_ID)
     if not types:
         return None, ("Impossibile leggere l'anagrafica IVA (/info/vat_types): "
@@ -326,10 +328,10 @@ def resolve_vat_id(vat_id):
     and the id deserves the same validation `vat_rate` gets."""
     if isinstance(vat_id, str) and vat_id.strip().isascii() and vat_id.strip().isdigit():
         vat_id = int(vat_id)
-    if isinstance(vat_id, bool) or not isinstance(vat_id, int):
-        return None, ("vat_id deve essere un intero: l'elenco delle aliquote configurate "
-                      "compare nel messaggio di rifiuto di vat_rate.")
     types = fetch_vat_types(company_id=COMPANY_ID)
+    if isinstance(vat_id, bool) or not isinstance(vat_id, int):
+        options = [(t["id"], t.get("description")) for t in types if not t.get("is_disabled")]
+        return None, f"vat_id '{vat_id}' non valido: usa un intero. Disponibili: {options}."
     if not types:
         return None, ("Impossibile leggere l'anagrafica IVA (/info/vat_types): "
                       "riprova, l'aliquota non può essere impostata senza.")
@@ -377,7 +379,8 @@ def build_items_list(items_data, negate=False):
             if error:
                 return None, error
         else:
-            vat_type, error = resolve_vat_type(item.get("vat_rate", 22))
+            rate = item.get("vat_rate")
+            vat_type, error = resolve_vat_type(22 if rate is None else rate)
             if error:
                 return None, error
         net_price = item["net_price"]
@@ -504,7 +507,7 @@ async def list_tools():
             "qty": {"type": "number", "description": "Quantità"},
             "net_price": {"type": "number", "description": "Prezzo netto unitario (sempre positivo)"},
             "vat_rate": {"type": "number", "description": "Aliquota IVA (es. 22). Risolta contro l'anagrafica IVA di FIC"},
-            "vat_id": {"type": "integer", "description": "ID aliquota IVA (opzionale, vince su vat_rate: serve quando più aliquote hanno la stessa percentuale ma natura diversa)"}
+            "vat_id": {"type": ["integer", "string"], "description": "ID aliquota IVA (opzionale, vince su vat_rate: serve quando più aliquote hanno la stessa percentuale ma natura diversa)"}
         },
         "required": ["name", "qty", "net_price"]
     }

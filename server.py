@@ -156,7 +156,7 @@ def resolve_payment_account(value):
     names = [a["name"] for a in accounts]
 
     if isinstance(value, int) and not isinstance(value, bool) or \
-            (isinstance(value, str) and value.strip().isdigit()):
+            (isinstance(value, str) and value.strip().isascii() and value.strip().isdigit()):
         wanted = int(value)
         for a in accounts:
             if a["id"] == wanted:
@@ -234,14 +234,29 @@ def _payment_days_of(doc):
     return 30 if days is None else days
 
 
+def _page_count(response):
+    """`last_page` as an int, defensively: a listing is one page unless the API
+    says otherwise."""
+    last_page = getattr(response, "last_page", 1)
+    return last_page if isinstance(last_page, int) and last_page > 0 else 1
+
+
+def _received_document_type(value):
+    """Normalize a ReceivedDocumentType, accepting the old `credit_note`
+    spelling this repo used to document. Returns (type, error)."""
+    doc_type = {"credit_note": "passive_credit_note"}.get(value, value)
+    if doc_type not in RECEIVED_DOCUMENT_TYPES:
+        return None, (f"type '{value}' non valido. Ammessi: {sorted(RECEIVED_DOCUMENT_TYPES)}.")
+    return doc_type, None
+
+
 def _all_pages(api_call, **kwargs):
     """Every list endpoint caps `per_page` at 100 (OpenAPI v2.1.8), so a single
     call is not a year of documents. Follow `last_page` instead of reporting a
     partial total."""
     response = api_call(per_page=100, page=1, **kwargs)
     docs = list(response.data or [])
-    last_page = getattr(response, "last_page", 1) or 1
-    for page in range(2, last_page + 1):
+    for page in range(2, _page_count(response) + 1):
         page_response = api_call(per_page=100, page=page, **kwargs)
         docs.extend(page_response.data or [])
     return docs
@@ -281,12 +296,24 @@ def resolve_vat_type(rate):
     if not types:
         return None, ("Impossibile leggere l'anagrafica IVA (/info/vat_types): "
                       "riprova, l'aliquota non può essere impostata senza.")
-    matches = [t for t in types if t.get("value") == rate and not t.get("is_disabled")]
+    matches = [
+        t for t in types
+        if t.get("value") is not None and round(t["value"], 2) == round(rate, 2)
+        and not t.get("is_disabled")
+    ]
     if not matches:
-        available = sorted({t["value"] for t in types if t.get("value") is not None})
+        available = sorted(
+            {(round(t["value"], 2), t.get("description")) for t in types if t.get("value") is not None}
+        )
         return None, (f"vat_rate {rate} non corrisponde a nessuna aliquota configurata. "
                       f"Disponibili: {available}.")
     matches.sort(key=lambda t: (not t.get("default"), t.get("id") or 0))
+    if len(matches) > 1 and not matches[0].get("default"):
+        # Several 0% types differ by natura (N1…N7), which ends up in the
+        # e-invoice XML: picking the lowest id would choose it silently.
+        options = [{"id": t["id"], "description": t.get("description")} for t in matches]
+        return None, (f"vat_rate {rate} corrisponde a {len(matches)} aliquote con natura "
+                      f"diversa: {options}. Indica quale con vat_id.")
     return matches[0], None
 
 
@@ -319,9 +346,12 @@ def build_items_list(items_data, negate=False):
     resolved to a vat type id, since FIC ignores the percentage in the body."""
     items_list = []
     for item in items_data:
-        vat_type, error = resolve_vat_type(item.get("vat_rate", 22))
-        if error:
-            return None, error
+        if item.get("vat_id") is not None:
+            vat_type = {"id": item["vat_id"], "value": item.get("vat_rate")}
+        else:
+            vat_type, error = resolve_vat_type(item.get("vat_rate", 22))
+            if error:
+                return None, error
         net_price = item["net_price"]
         if negate:
             net_price = -abs(net_price)
@@ -336,6 +366,15 @@ def build_items_list(items_data, negate=False):
             "_vat_value": vat_type.get("value") or 0,
         })
     return items_list, None
+
+
+def _item_net(item):
+    """Taxable amount of a line. `discount` is a percentual value on the net
+    price (OpenAPI: "Issued document item discount percentual value")."""
+    qty = item.get("qty") or 0
+    net_price = item.get("net_price") or 0
+    discount = item.get("discount") or 0
+    return qty * net_price * (1 - discount / 100)
 
 
 def _vat_value(item):
@@ -373,7 +412,7 @@ def build_issued_document(doc_type, client_id, items_data, date_str, payment_day
     invoice_date = datetime.strptime(date_str, "%Y-%m-%d")
     due_date = invoice_date + timedelta(days=payment_days)
     total_abs = sum(
-        abs(i["qty"] * i["net_price"]) * (1 + _vat_value(i) / 100)
+        abs(_item_net(i)) * (1 + _vat_value(i) / 100)
         for i in items_list
     )
     result_total = -total_abs if negate_prices else total_abs
@@ -436,7 +475,8 @@ async def list_tools():
             "description": {"type": "string", "description": "Descrizione estesa"},
             "qty": {"type": "number", "description": "Quantità"},
             "net_price": {"type": "number", "description": "Prezzo netto unitario (sempre positivo)"},
-            "vat_rate": {"type": "number", "description": "Aliquota IVA (es. 22)"}
+            "vat_rate": {"type": "number", "description": "Aliquota IVA (es. 22). Risolta contro l'anagrafica IVA di FIC"},
+            "vat_id": {"type": "integer", "description": "ID aliquota IVA (opzionale, vince su vat_rate: serve quando più aliquote hanno la stessa percentuale ma natura diversa)"}
         },
         "required": ["name", "qty", "net_price"]
     }
@@ -613,7 +653,7 @@ async def list_tools():
         ),
         Tool(
             name="update_document",
-            description="Modifica parziale di un documento BOZZA (fattura, NDC, proforma). Passa solo i campi da aggiornare. Funziona solo su documenti non ancora inviati allo SDI. Rifiuta le modifiche che riscriverebbero lo scadenzario: documenti con più rate, o con pagamenti già registrati di cui cambierebbe il totale. In quei casi azzerare prima il pagamento con set_payment, o modificare il documento dal pannello FattureInCloud. IMPORTANTE: Chiedere sempre conferma all'utente prima di eseguire.",
+            description="Modifica parziale di un documento BOZZA (fattura, NDC, proforma). Passa solo i campi da aggiornare. Funziona solo su documenti non ancora inviati allo SDI. Rifiuta le modifiche che riscriverebbero lo scadenzario: se il documento ha un pagamento registrato su rata singola di cui cambierebbe il totale, azzerare prima il pagamento con set_payment; se ha più rate, il piano va modificato dal pannello FattureInCloud. IMPORTANTE: Chiedere sempre conferma all'utente prima di eseguire.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -872,7 +912,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     if query.lower() not in search_text:
                         continue
                 invoices.append(inv)
-            return [TextContent(type="text", text=json.dumps(invoices, indent=2, ensure_ascii=False))]
+            pages = _page_count(response)
+            payload = {
+                "count": len(invoices),
+                "pages": pages,
+                "truncated": pages > 1,
+                "documents": invoices,
+            }
+            return [TextContent(type="text", text=json.dumps(payload, indent=2, ensure_ascii=False))]
 
         elif name == "get_invoice":
             doc_id = arguments["document_id"]
@@ -1104,7 +1151,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
             invoice_date = datetime.strptime(date_str[:10], "%Y-%m-%d")
             due_date = invoice_date + timedelta(days=payment_days)
-            total_gross = sum((i.get("qty") or 0) * (i.get("net_price") or 0) * (1 + _vat_value(i) / 100) for i in items_list)
+            total_gross = sum(_item_net(i) * (1 + _vat_value(i) / 100) for i in items_list)
 
             revenue_center = arguments.get("revenue_center") or orig.get("rc_center")
             if revenue_center:
@@ -1200,7 +1247,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             invoice_date = datetime.strptime(date_str[:10], "%Y-%m-%d")
             due_date = invoice_date + timedelta(days=payment_days)
             total_abs = sum(
-                abs((i.get("qty") or 0) * (i.get("net_price") or 0)) * (1 + _vat_value(i) / 100)
+                abs(_item_net(i)) * (1 + _vat_value(i) / 100)
                 for i in items_list
             )
             result_total = -total_abs if is_credit_note else total_abs
@@ -1370,7 +1417,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             payment_terms_type = _enum_value(_payment_terms_of(orig).get("type")) or "standard"
 
             due_date = invoice_date + timedelta(days=payment_days)
-            total_gross = sum((i.get("qty") or 0) * (i.get("net_price") or 0) * (1 + _vat_value(i) / 100) for i in items_list)
+            total_gross = sum(_item_net(i) * (1 + _vat_value(i) / 100) for i in items_list)
 
             revenue_center = arguments.get("revenue_center") or orig.get("rc_center")
             if revenue_center:
@@ -1512,7 +1559,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         elif name == "list_received_documents":
             year = arguments.get("year", datetime.now().year)
             month = arguments.get("month")
-            doc_type = arguments.get("type", "expense")
+            doc_type, type_error = _received_document_type(arguments.get("type", "expense"))
+            if type_error:
+                return _error(type_error)
             query = arguments.get("query")
             q = f"date >= '{year}-01-01' and date <= '{year}-12-31'"
             if month:
@@ -1536,7 +1585,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 if d.get("rc_center"):
                     entry["cost_center"] = d["rc_center"]
                 docs.append(entry)
-            return [TextContent(type="text", text=json.dumps(docs, indent=2, ensure_ascii=False))]
+            pages = _page_count(response)
+            payload = {
+                "count": len(docs),
+                "pages": pages,
+                "truncated": pages > 1,
+                "documents": docs,
+            }
+            return [TextContent(type="text", text=json.dumps(payload, indent=2, ensure_ascii=False))]
 
         elif name == "get_situation":
             year = arguments.get("year", datetime.now().year)
@@ -1611,17 +1667,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         elif name == "check_numeration":
             year = arguments.get("year", datetime.now().year)
             q = f"date >= '{year}-01-01' and date <= '{year}-12-31'"
-            response = issued_api.list_issued_documents(
-                company_id=COMPANY_ID, type="invoice", q=q, per_page=100
-            )
-            docs = [d.to_dict() for d in (response.data or [])]
-            total_pages = getattr(response, 'last_page', 1) or 1
-            if total_pages > 1:
-                for page in range(2, total_pages + 1):
-                    page_resp = issued_api.list_issued_documents(
-                        company_id=COMPANY_ID, type="invoice", q=q, per_page=100, page=page
-                    )
-                    docs.extend([d.to_dict() for d in (page_resp.data or [])])
+            docs = [
+                d.to_dict() for d in _all_pages(
+                    issued_api.list_issued_documents,
+                    company_id=COMPANY_ID, type="invoice", q=q
+                )
+            ]
             if not docs:
                 return [TextContent(type="text", text=json.dumps({
                     "year": year, "status": "Nessuna fattura trovata per questo anno"
@@ -1729,12 +1780,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             elif isinstance(index, str) and index.strip().lower() == "all":
                 targets = list(range(len(payments)))
             else:
-                if isinstance(index, bool) or not (
-                    isinstance(index, int)
-                    or (isinstance(index, str) and index.strip().lstrip("-").isdigit())
-                ):
+                if isinstance(index, bool) or not isinstance(index, (int, str)):
                     return _error('payment_index deve essere un intero oppure "all".')
-                wanted = int(index)
+                if isinstance(index, str) and not index.strip().lstrip("+-").isascii():
+                    return _error('payment_index deve essere un intero oppure "all".')
+                try:
+                    wanted = int(index)
+                except ValueError:
+                    return _error('payment_index deve essere un intero oppure "all".')
                 if not 0 <= wanted <= last:
                     return _error(
                         f"payment_index {index} fuori intervallo: il documento ha "
@@ -1768,9 +1821,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 # ModifyReceivedDocumentRequest marks data.entity required
                 # (openapi-enriched.yaml), unlike the issued document one.
                 entity = d.get("entity") or {}
-                if hasattr(entity, "to_dict"):
-                    entity = entity.to_dict()
-                data["entity"] = {k: v for k, v in entity.items() if v is not None}
+                entity = {k: v for k, v in entity.items() if v is not None}
+                if entity:
+                    data["entity"] = entity
             body = {"data": data}
             if doc_kind == "issued":
                 response = issued_api.modify_issued_document(
@@ -1812,7 +1865,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             # The response is the document as stored, so check it rather than
             # reporting a clean success over a document that lost its content.
             warning = None
-            if (d.get("items_list") or []) and not (updated.get("items_list") or []):
+            if doc_kind == "received" and (d.get("entity") or {}) and updated.get("entity") == {}:
+                warning = (
+                    "Il documento è tornato dall'API senza fornitore: la PUT potrebbe aver "
+                    "sostituito il documento invece di aggiornarne solo le rate. Verificalo "
+                    "dal pannello FattureInCloud prima di registrare altri pagamenti."
+                )
+            if (d.get("items_list") or []) and updated.get("items_list") == []:
                 warning = (
                     "Il documento è tornato dall'API senza items_list: la PUT potrebbe aver "
                     "sostituito il documento invece di aggiornarne solo le rate. Verifica le "
@@ -1890,15 +1949,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                         "error": f"cost_center '{cost_center}' non esiste. Disponibili: {known}."
                     }, ensure_ascii=False))]
 
-            doc_type = arguments.get("type", "expense")
-            # ReceivedDocumentType has no `credit_note`: the passive one is
-            # `passive_credit_note`. Keep the old spelling working as an alias.
-            doc_type = {"credit_note": "passive_credit_note"}.get(doc_type, doc_type)
-            if doc_type not in RECEIVED_DOCUMENT_TYPES:
-                return _error(
-                    f"type '{arguments.get('type')}' non valido. "
-                    f"Ammessi: {sorted(RECEIVED_DOCUMENT_TYPES)}."
-                )
+            doc_type, type_error = _received_document_type(arguments.get("type", "expense"))
+            if type_error:
+                return _error(type_error)
             date_str = arguments.get("date", datetime.now().strftime("%Y-%m-%d"))
             amount_net = arguments["amount_net"]
             amount_vat = arguments.get("amount_vat", 0)

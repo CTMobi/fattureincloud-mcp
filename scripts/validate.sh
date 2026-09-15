@@ -80,24 +80,37 @@ if [[ -f "$MANIFEST" ]] && command -v jq >/dev/null 2>&1; then
   else
     staging=$(mktemp -d)
     trap 'rm -rf "$staging"' EXIT
-    unzip -qq "$BUNDLE" -d "$staging"
 
-    # cwd is the extracted bundle, so `import server` resolves the packed file
-    # and PYTHONPATH=lib its packed dependencies.
-    runtime=$(cd "$staging" && PYTHONPATH=lib FIC_ACCESS_TOKEN=validate FIC_COMPANY_ID=0 \
-      python3 -c '
+    if ! unzip -qq "$BUNDLE" -d "$staging" 2>"$staging/unzip.err"; then
+      err "$BUNDLE could not be extracted (corrupt bundle? run ./scripts/build.sh)"
+      sed 's/^/     /' "$staging/unzip.err" >&2 || true
+    else
+      # cwd is the extracted bundle, so `import server` resolves the packed file
+      # and PYTHONPATH=lib its packed dependencies.
+      runtime=$(cd "$staging" && PYTHONPATH=lib FIC_ACCESS_TOKEN=validate FIC_COMPANY_ID=0 \
+        python3 -c '
 import asyncio, server
 print("\n".join(sorted(t.name for t in asyncio.run(server.list_tools()))))
 ' 2>"$staging/import.err") || runtime=""
 
-    if [[ -z "$runtime" ]]; then
-      err "the bundled server.py did not start (the extension would fail at launch)"
-      sed 's/^/     /' "$staging/import.err" >&2 || true
-    elif [[ "$runtime" != "$declared" ]]; then
-      err "manifest tools != bundled runtime tools"
-      diff <(echo "$declared") <(echo "$runtime") | sed 's/^/     /' >&2 || true
-    else
-      echo "bundled runtime:  $(wc -l <<< "$runtime") tools (match manifest)"
+      # The bundle carries its own manifest: comparing it against the bundled
+      # runtime keeps "the bundle is inconsistent" apart from "the bundle is
+      # simply older than the checkout", which are different things to fix.
+      packed=$(jq -r '.tools[].name' "$staging/manifest.json" 2>/dev/null | LC_ALL=C sort)
+      packed_version=$(jq -r '.version' "$staging/manifest.json" 2>/dev/null || echo "?")
+
+      if [[ -z "$runtime" ]]; then
+        err "the bundled server.py did not start (the extension would fail at launch)"
+        sed 's/^/     /' "$staging/import.err" >&2 || true
+      elif [[ "$runtime" != "$packed" ]]; then
+        err "bundled manifest tools != bundled runtime tools"
+        diff <(echo "$packed") <(echo "$runtime") | sed 's/^/     /' >&2 || true
+      elif [[ "$packed" != "$declared" || "$packed_version" != "$manifest_version" ]]; then
+        err "bundle is stale (packed $packed_version vs manifest $manifest_version): run ./scripts/build.sh"
+        diff <(echo "$declared") <(echo "$packed") | sed 's/^/     /' >&2 || true
+      else
+        echo "bundled runtime:  $(wc -l <<< "$runtime") tools (match manifest, v$packed_version)"
+      fi
     fi
   fi
 fi

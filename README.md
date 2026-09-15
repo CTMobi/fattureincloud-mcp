@@ -146,6 +146,7 @@ set_payment(document_id, document_type="issued"|"received", status="paid"|"not_p
 ```
 
 - `paid_date` defaults to today, or to the date already registered on the installment when there is one, so replaying the call does not move a payment. With `status="not_paid"` the paid date and the account are cleared.
+- `vat_rate` on a line is resolved against the VAT registry, since FattureInCloud ignores the percentage in the request body and reads the rate from the VAT type id. When several types share a percentage but differ in *natura* (the 0% ones — esente, non imponibile, fuori campo), the call is refused with the candidates and you pick one with `vat_id`.
 - `payment_account` accepts either the numeric id or the account name (case-insensitive, unique substrings work). Run `list_payment_accounts` to see what is configured. Without an account the payment is registered but does not land in FattureInCloud's cash flow.
 - **Installments:** documents with a single installment need no `payment_index`. With more than one, the call is refused and returns the installment list (index, amount, due date) so you can pick — or pass `payment_index="all"` to settle every installment at once.
 
@@ -153,7 +154,7 @@ set_payment(document_id, document_type="issued"|"received", status="paid"|"not_p
 
 FattureInCloud documents neither behaviour — the API reference and the OpenAPI spec say only *"Modifies the specified document."* and mark no field required. FIC staff describe the modify calls as a merge on the company's own forum ([discussion 295](https://github.com/fattureincloud/api/discussions/295)) and prescribe exactly this payments-only shape for marking an invoice paid ([discussion 239](https://github.com/fattureincloud/api/discussions/239)), with the array caveat above stated in [discussion 427](https://github.com/fattureincloud/api/discussions/427). None of that is a versioned guarantee, so `set_payment` checks the document the API returns: if the line items it had are gone, the result carries a `warning` instead of reporting a clean success.
 
-`update_document` refuses any edit that would rewrite the payment schedule and points back to `set_payment`: documents with several installments (rebuilding would flatten a 30/60/90 plan into a single due date) and documents with a registered payment whose total would change (that would report cash that was never collected). Edits that leave the schedule alone — subject, line descriptions, a new due date on a single installment, or re-sending values that did not actually change — keep working.
+`update_document` refuses any edit that would rewrite the payment schedule. A registered payment on a single installment whose total would change has to be cleared with `set_payment` first — rewriting it would report cash that was never collected. An installment plan cannot be rebuilt through the API at all (flattening a 30/60/90 plan into one due date is a loss that cannot be undone), so it has to be changed in FattureInCloud. Edits that leave the schedule alone — subject, line descriptions, a new due date on a single installment, or re-sending values that did not actually change — keep working.
 
 ## Cost / Revenue Centers
 

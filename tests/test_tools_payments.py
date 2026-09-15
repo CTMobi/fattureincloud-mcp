@@ -1428,3 +1428,156 @@ def test_create_credit_note_does_not_claim_a_link_it_cannot_make(server_module):
     assert payload["success"] is True
     assert "41" in payload["message"]
     assert "collegamento" in payload["message"].lower()
+
+
+# --------------------------------------------------------------------------
+# review round 5
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("index", ["²", "--1", "٥"])
+def test_set_payment_rejects_digit_lookalikes(server_module, index):
+    """isdigit() is not the predicate of int(): superscripts and double signs
+    raise, and non-ASCII digits would silently select an installment."""
+    server = server_module
+    doc = _issued_doc([_rate(610.0, "2026-01-31"), _rate(610.0, "2026-02-28")])
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document") as modify:
+        result = _run(server.call_tool("set_payment", {
+            "document_id": 42, "document_type": "issued", "status": "paid",
+            "payment_index": index,
+        }))
+
+    assert not modify.called
+    assert "payment_index" in json.loads(result[0].text)["error"]
+
+
+def test_set_payment_does_not_warn_when_the_response_omits_items(server_module):
+    """A response that says nothing about items_list is not evidence of a wipe."""
+    server = server_module
+    doc = _issued_doc([_rate(1220.0, "2026-02-09")])
+    without_items = {k: v for k, v in _issued_doc(
+        [_rate(1220.0, "2026-02-09", "paid", paid_date="2026-02-05")]).items()
+        if k != "items_list"}
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document",
+                      return_value=_doc_response(without_items)):
+        result = _run(server.call_tool("set_payment", {
+            "document_id": 42, "document_type": "issued", "status": "paid",
+        }))
+
+    assert "warning" not in json.loads(result[0].text)
+
+
+def test_set_payment_received_omits_an_empty_entity(server_module):
+    """entity is required on the received PUT: sending {} would write an empty
+    supplier instead of leaving the stored one alone."""
+    server = server_module
+    doc = _received_doc([_rate(610.0, "2026-02-09")])
+    doc["entity"] = {}
+
+    with patch.object(server.received_api, "get_received_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.received_api, "modify_received_document",
+                      return_value=_doc_response(doc)) as modify:
+        _run(server.call_tool("set_payment", {
+            "document_id": 99, "document_type": "received", "status": "paid",
+        }))
+
+    assert "entity" not in _sent_data(modify, "modify_received_document_request")
+
+
+def test_update_document_applies_line_discounts_to_the_installment(server_module):
+    """`discount` is a percentage on the line (enriched:2811): now that echoed
+    items keep it, the recomputed total has to apply it."""
+    server = server_module
+    # 1000 net, 10% line discount, 10% VAT -> 900 * 1.10 = 990
+    doc = _issued_doc([_rate(990.0, "2026-02-09")])
+    doc["items_list"] = [{
+        "name": "Item", "qty": 1, "net_price": 1000.0, "discount": 10.0,
+        "vat": {"id": 3, "value": 10.0},
+    }]
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document",
+                      return_value=_doc_response(doc)) as modify, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme"}):
+        result = _run(server.call_tool("update_document", {
+            "document_id": 42, "date": "2026-01-15",
+        }))
+
+    payload = json.loads(result[0].text)
+    assert payload["success"] is True, payload
+    sent = _sent_payments(modify, "modify_issued_document_request")
+    assert sent[0]["amount"] == 990.0
+
+
+def test_list_invoices_reports_truncation(server_module):
+    """per_page caps at 100: a longer year must not look complete."""
+    server = server_module
+    doc = MagicMock()
+    doc.to_dict.return_value = _issued_doc([_rate(1220.0, "2026-02-09")])
+    listed = MagicMock()
+    listed.data = [doc]
+    listed.last_page = 3
+
+    with patch.object(server.issued_api, "list_issued_documents", return_value=listed):
+        result = _run(server.call_tool("list_invoices", {"year": 2026}))
+
+    payload = json.loads(result[0].text)
+    assert payload["truncated"] is True
+    assert payload["pages"] == 3
+    assert len(payload["documents"]) == 1
+
+
+def test_list_received_documents_normalizes_the_type_alias(server_module):
+    server = server_module
+    listed = MagicMock()
+    listed.data = []
+    listed.last_page = 1
+
+    with patch.object(server.received_api, "list_received_documents",
+                      return_value=listed) as call:
+        _run(server.call_tool("list_received_documents", {"year": 2026, "type": "credit_note"}))
+
+    assert call.call_args.kwargs["type"] == "passive_credit_note"
+
+
+def test_resolve_vat_type_refuses_an_ambiguous_rate(server_module):
+    """Several 0% types differ by natura (N1…N7) — picking the lowest id would
+    silently choose the e-invoice nature."""
+    server = server_module
+    import cache as cache_mod
+    cache_mod.invalidate_all(100)
+    zero_rates = MagicMock()
+    zero_rates.data = [_sdk_obj(v) for v in [
+        {"id": 6, "value": 0.0, "description": "Non imponibile art. 8", "is_disabled": False, "default": False},
+        {"id": 7, "value": 0.0, "description": "Esente art. 10", "is_disabled": False, "default": False},
+    ]]
+
+    with patch.object(server.info_api, "list_vat_types", return_value=zero_rates):
+        vat_type, error = server.resolve_vat_type(0)
+
+    assert vat_type is None
+    assert "Esente art. 10" in error and "Non imponibile art. 8" in error
+
+
+def test_create_invoice_accepts_an_explicit_vat_id(server_module):
+    """The escape hatch from an ambiguous rate."""
+    server = server_module
+    created = MagicMock()
+    created.data.to_dict.return_value = {"id": 1, "number": 1, "date": "2026-01-10"}
+
+    with patch.object(server.issued_api, "create_issued_document", return_value=created) as create, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme", "ei_code": "ABC1"}):
+        _run(server.call_tool("create_invoice", {
+            "client_id": 5, "date": "2026-01-10", "visible_subject": "Test",
+            "items": [{"name": "Item", "qty": 1, "net_price": 100.0, "vat_id": 6}],
+        }))
+
+    item = create.call_args.kwargs["create_issued_document_request"]["data"]["items_list"][0]
+    assert item["vat"] == {"id": 6}

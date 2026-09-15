@@ -250,7 +250,7 @@ def test_list_invoices_includes_revenue_center(server_module):
     with patch.object(server.issued_api, "list_issued_documents", return_value=list_response):
         result = _run(server.call_tool("list_invoices", {"year": 2026}))
 
-    invoices = json.loads(result[0].text)
+    invoices = json.loads(result[0].text)["documents"]
     assert invoices[0]["revenue_center"] == "Project Alpha"
     assert "revenue_center" not in invoices[1]
 
@@ -408,6 +408,6 @@ def test_list_received_documents_includes_cost_center(server_module):
     with patch.object(server.received_api, "list_received_documents", return_value=list_response):
         result = _run(server.call_tool("list_received_documents", {"year": 2026}))
 
-    docs = json.loads(result[0].text)
+    docs = json.loads(result[0].text)["documents"]
     assert docs[0]["cost_center"] == "Project Alpha"
     assert "cost_center" not in docs[1]

@@ -378,11 +378,14 @@ def build_items_list(items_data, negate=False):
     items_list = []
     for item in items_data:
         position = len(items_list)
-        for field in ("name", "qty", "net_price"):
-            if item.get(field) is None:
-                return None, f"La riga in posizione {position} non ha {field}: è obbligatorio."
+        if not isinstance(item, dict):
+            return None, (f"La riga in posizione {position} non è un oggetto: "
+                          f"ricevuto {item!r}.")
+        if not (isinstance(item.get("name"), str) and item["name"].strip()):
+            return None, (f"La riga in posizione {position} non ha un name valido: "
+                          "serve una stringa non vuota.")
         for field in ("qty", "net_price"):
-            value = item[field]
+            value = item.get(field)
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 return None, (f"La riga in posizione {position} ha {field} = {value!r}: "
                               "serve un numero.")

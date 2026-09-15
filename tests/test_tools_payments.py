@@ -1888,3 +1888,30 @@ def test_create_invoice_rejects_a_line_without_name(server_module):
     error = json.loads(result[0].text)["error"]
     assert "posizione 1" in error
     assert "name" in error
+
+
+# --------------------------------------------------------------------------
+# review round 12
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("items", [
+    [None],
+    ["Consulenza"],
+    [{"name": 123, "qty": 1, "net_price": 100.0}],
+    [{"name": "   ", "qty": 1, "net_price": 100.0}],
+])
+def test_create_invoice_rejects_malformed_lines(server_module, items):
+    """item.get() on a non-dict raises, and a non-string name reaches the SDK
+    model: both come back as stacktraces."""
+    server = server_module
+
+    with patch.object(server.issued_api, "create_issued_document") as create, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme", "ei_code": "A1"}):
+        result = _run(server.call_tool("create_invoice", {
+            "client_id": 5, "date": "2026-01-10", "visible_subject": "Test", "items": items,
+        }))
+
+    assert not create.called
+    payload = json.loads(result[0].text)
+    assert payload["success"] is False
+    assert "posizione 0" in payload["error"]

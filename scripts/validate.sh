@@ -119,7 +119,7 @@ print("\n".join(sorted(t.name for t in asyncio.run(server.list_tools()))))
       elif [[ -n "$declared" && "$packed" != "$declared" ]]; then
         err "bundle is stale (tools differ from $MANIFEST): run ./scripts/build.sh"
         diff <(echo "$declared") <(echo "$packed") | sed 's/^/     /' >&2 || true
-      elif [[ -n "$manifest_version" && ( -z "$packed_version" || "$packed_version" == "null" ) ]]; then
+      elif [[ -z "$packed_version" || "$packed_version" == "null" ]]; then
         err "the bundled manifest.json has no version: rebuild it with ./scripts/build.sh"
       elif [[ -n "$manifest_version" && "$packed_version" != "$manifest_version" ]]; then
         err "bundle is stale (packed $packed_version vs manifest $manifest_version): run ./scripts/build.sh"

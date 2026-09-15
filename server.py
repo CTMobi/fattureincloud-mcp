@@ -218,6 +218,15 @@ def _payment_entry(p):
     return entry
 
 
+def _payment_days_of(doc):
+    """Payment-term days of a document's first installment. FIC can return
+    `payment_terms: null` or `days: null`, and `days: 0` (rimessa diretta) is a
+    real term that must survive."""
+    terms = ((doc.get("payments_list") or [{}])[0] or {}).get("payment_terms") or {}
+    days = terms.get("days")
+    return 30 if days is None else days
+
+
 def _error(message, **extra):
     payload = {"success": False, "error": message}
     payload.update(extra)
@@ -690,7 +699,7 @@ async def list_tools():
                         "enum": ["paid", "not_paid"],
                         "description": "paid = registra incasso/pagamento, not_paid = annulla la registrazione"
                     },
-                    "paid_date": {"type": "string", "description": "Data incasso/pagamento YYYY-MM-DD (default: oggi). Ignorata con status not_paid"},
+                    "paid_date": {"type": "string", "description": "Data incasso/pagamento YYYY-MM-DD (default: oggi, oppure la data già registrata sulla rata). Ignorata con status not_paid"},
                     "payment_account": {
                         "type": ["string", "integer"],
                         "description": "Conto su cui registrare: id numerico o nome (vedi list_payment_accounts). Opzionale; ignorato con status not_paid"
@@ -1005,8 +1014,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     "vat": {"id": 0, "value": i.get("vat", {}).get("value", 22)}
                 })
 
-            orig_payments = orig.get("payments_list", [{}])
-            payment_days = orig_payments[0].get("payment_terms", {}).get("days", 30) if orig_payments else 30
+            payment_days = _payment_days_of(orig)
 
             invoice_date = datetime.strptime(date_str[:10], "%Y-%m-%d")
             due_date = invoice_date + timedelta(days=payment_days)
@@ -1079,7 +1087,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     "error": f"Impossibile modificare: documento già inviato allo SDI. Stato: {current_status}"
                 }, ensure_ascii=False))]
 
-            doc_type = orig.get("type", "invoice")
+            doc_type = _enum_value(orig.get("type")) or "invoice"
             is_credit_note = (doc_type == "credit_note")
 
             date_str = arguments.get("date") or str(orig.get("date", datetime.now().strftime("%Y-%m-%d")))
@@ -1098,11 +1106,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                         "vat": {"id": 0, "value": i.get("vat", {}).get("value", 22)}
                     })
 
-            if "payment_days" in arguments:
-                payment_days = arguments["payment_days"]
-            else:
-                orig_payments = orig.get("payments_list", [{}])
-                payment_days = orig_payments[0].get("payment_terms", {}).get("days", 30) if orig_payments else 30
+            orig_days = _payment_days_of(orig)
+            payment_days = arguments.get("payment_days", orig_days)
 
             invoice_date = datetime.strptime(date_str[:10], "%Y-%m-%d")
             due_date = invoice_date + timedelta(days=payment_days)
@@ -1134,8 +1139,6 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             # (argument presence is not enough: clients echo back unchanged fields).
             existing_payments = [_payment_entry(p) for p in (orig.get("payments_list") or [])]
             existing_total = round(sum(p.get("amount") or 0 for p in existing_payments), 2)
-            orig_terms = ((orig.get("payments_list") or [{}])[0].get("payment_terms") or {})
-            orig_days = 30 if orig_terms.get("days") is None else orig_terms["days"]
             schedule_moved = (
                 date_str[:10] != str(orig.get("date", ""))[:10]
                 or payment_days != orig_days
@@ -1150,7 +1153,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             elif (registered and total_moved) or len(existing_payments) > 1:
                 reason = (
                     f"ha {len(registered)} rata/e con pagamento registrato: modificarne importo "
-                    "o scadenze riscriverebbe un incasso già contabilizzato"
+                    f"o scadenze riscriverebbe un incasso già contabilizzato "
+                    f"(totale ricalcolato {round(total_abs, 2)}, somma rate {existing_total})"
                     if registered else
                     f"ha un piano di {len(existing_payments)} rate: ricostruirlo lo ridurrebbe "
                     "a un'unica scadenza, perdendo la rateizzazione"
@@ -1256,8 +1260,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             if payment_days_override is not None:
                 payment_days = payment_days_override
             else:
-                orig_payments = orig.get("payments_list", [{}])
-                payment_days = orig_payments[0].get("payment_terms", {}).get("days", 30) if orig_payments else 30
+                payment_days = _payment_days_of(orig)
 
             due_date = invoice_date + timedelta(days=payment_days)
             total_gross = sum(i["qty"] * i["net_price"] * (1 + i["vat"]["value"] / 100) for i in items_list)
@@ -1558,6 +1561,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             if status not in ("paid", "not_paid"):
                 return _error("status deve essere 'paid' o 'not_paid'.")
 
+            paid_date = (arguments.get("paid_date") or datetime.now().strftime("%Y-%m-%d"))[:10]
+            try:
+                datetime.strptime(paid_date, "%Y-%m-%d")
+            except ValueError:
+                return _error(
+                    f"paid_date '{arguments.get('paid_date')}' non valida: usa il formato YYYY-MM-DD."
+                )
+
             account = None
             if status == "paid" and arguments.get("payment_account") is not None:
                 account, account_error = resolve_payment_account(arguments["payment_account"])
@@ -1616,14 +1627,6 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                         f"{len(payments)} rate (0-{last})."
                     )
                 targets = [wanted]
-
-            paid_date = (arguments.get("paid_date") or datetime.now().strftime("%Y-%m-%d"))[:10]
-            try:
-                datetime.strptime(paid_date, "%Y-%m-%d")
-            except ValueError:
-                return _error(
-                    f"paid_date '{arguments.get('paid_date')}' non valida: usa il formato YYYY-MM-DD."
-                )
 
             for i in targets:
                 entry = payments[i]

@@ -33,11 +33,15 @@ fi
 if [[ ! -f "$BUNDLE" ]]; then
   warn "$BUNDLE not found (run ./scripts/build.sh to produce it)"
 else
-  size=$(stat -c '%s' "$BUNDLE" 2>/dev/null || stat -f '%z' "$BUNDLE" 2>/dev/null || echo 0)
-  size_mb=$((size / 1024 / 1024))
-  echo "bundle: $BUNDLE (${size_mb} MB)"
-  if [[ $size_mb -gt 50 ]]; then
-    warn "bundle exceeds 50 MB"
+  size=$(stat -c '%s' "$BUNDLE" 2>/dev/null || stat -f '%z' "$BUNDLE" 2>/dev/null || echo "")
+  if [[ -z "$size" ]]; then
+    warn "no known stat form available; bundle size check skipped"
+  else
+    size_mb=$((size / 1024 / 1024))
+    echo "bundle: $BUNDLE (${size_mb} MB)"
+    if [[ $size_mb -gt 50 ]]; then
+      warn "bundle exceeds 50 MB"
+    fi
   fi
 fi
 
@@ -61,10 +65,33 @@ else
   warn "jq not available or manifest missing; skipping version coherence check"
 fi
 
-# 3. Tool count coherence (manifest declared vs server runtime)
+# 3. Tool coherence: the manifest must match what the bundled server really
+#    serves. Importing server.py from lib/ is also the cheapest check that the
+#    bundle starts at all — a dependency that breaks the entry point (as mcp 2.x
+#    did) shows up here instead of at the user's first launch.
 if [[ -f "$MANIFEST" ]] && command -v jq >/dev/null 2>&1; then
-  declared=$(jq -r '.tools | length' "$MANIFEST")
-  echo "manifest declares $declared tools (annotations live at runtime in server.py Tool() declarations)"
+  declared=$(jq -r '.tools[].name' "$MANIFEST" | sort)
+  echo "manifest declares $(wc -l <<< "$declared") tools"
+
+  if [[ ! -d lib ]]; then
+    warn "lib/ not built; skipping runtime tool check (run ./scripts/build.sh)"
+  elif ! command -v python3 >/dev/null 2>&1; then
+    warn "python3 not available; skipping runtime tool check"
+  else
+    runtime=$(PYTHONPATH=lib FIC_ACCESS_TOKEN=validate FIC_COMPANY_ID=0 python3 -c '
+import asyncio, server
+print("\n".join(sorted(t.name for t in asyncio.run(server.list_tools()))))
+' 2>/dev/null) || runtime=""
+
+    if [[ -z "$runtime" ]]; then
+      err "server.py did not start from lib/ (the bundle would fail at launch)"
+    elif [[ "$runtime" != "$declared" ]]; then
+      err "manifest tools != runtime tools"
+      diff <(echo "$declared") <(echo "$runtime") | sed 's/^/     /' >&2 || true
+    else
+      echo "runtime tools:    $(wc -l <<< "$runtime") (match manifest)"
+    fi
+  fi
 fi
 
 # 4. icon.png present + size hint

@@ -926,3 +926,105 @@ def test_get_situation_counts_reversed_as_outstanding(server_module):
     assert payload["incassato"] == 0.0
     assert payload["da_incassare"] == 1220.0
     assert [s["amount"] for s in payload["prossime_scadenze"]] == [1220.0]
+
+
+# --------------------------------------------------------------------------
+# review round 3
+# --------------------------------------------------------------------------
+
+def test_update_document_on_sdk_shaped_credit_note(server_module):
+    """Credit note fixtures were always plain strings, so nothing pinned the
+    behaviour on the enum-typed `type` the API really returns."""
+    server = server_module
+    payload = _issued_doc([_rate(1220.0, "2026-02-09")])
+    payload["type"] = "credit_note"
+    doc = _sdk_shaped(payload)
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document",
+                      return_value=_doc_response(doc)) as modify, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme"}):
+        result = _run(server.call_tool("update_document", {
+            "document_id": 42, "visible_subject": "Nuovo",
+        }))
+
+    data = _sent_data(modify, "modify_issued_document_request")
+    assert data["type"] == "credit_note"
+    assert data["e_invoice"] is True
+    assert data["ei_data"] == {"payment_method": "MP05"}
+    payload = json.loads(result[0].text)
+    assert payload["total"] == -1220.0
+    assert payload["type"] == "credit_note"
+
+
+def test_update_document_survives_null_payment_terms(server_module):
+    """FIC can return payment_terms: null, and days: null inside it."""
+    server = server_module
+    doc = _issued_doc([_rate(1220.0, "2026-02-09")])
+    doc["payments_list"][0]["payment_terms"] = None
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document",
+                      return_value=_doc_response(doc)) as modify, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme"}):
+        result = _run(server.call_tool("update_document", {
+            "document_id": 42, "visible_subject": "Nuovo",
+        }))
+
+    assert modify.called
+    assert json.loads(result[0].text)["success"] is True
+
+
+def test_update_document_survives_null_payment_days(server_module):
+    server = server_module
+    doc = _issued_doc([_rate(1220.0, "2026-02-09",
+                             payment_terms={"days": None, "type": "standard"})])
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document",
+                      return_value=_doc_response(doc)) as modify, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme"}):
+        result = _run(server.call_tool("update_document", {
+            "document_id": 42, "visible_subject": "Nuovo",
+        }))
+
+    assert modify.called
+    assert json.loads(result[0].text)["success"] is True
+
+
+def test_set_payment_validates_paid_date_before_fetching(server_module):
+    """A malformed date must not cost an API round-trip."""
+    server = server_module
+
+    with patch.object(server.issued_api, "get_issued_document") as get_doc, \
+         patch.object(server.issued_api, "modify_issued_document") as modify:
+        result = _run(server.call_tool("set_payment", {
+            "document_id": 42, "document_type": "issued", "status": "paid",
+            "paid_date": "oggi",
+        }))
+
+    assert not get_doc.called
+    assert not modify.called
+    assert json.loads(result[0].text)["success"] is False
+
+
+def test_update_document_refusal_names_both_totals(server_module):
+    """The refusal message must not claim a changed total without showing the
+    two numbers it compared."""
+    server = server_module
+    doc = _issued_doc([_rate(1220.0, "2026-02-09", "paid", paid_date="2026-02-05")])
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document"), \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme"}):
+        result = _run(server.call_tool("update_document", {
+            "document_id": 42,
+            "items": [{"name": "Item", "qty": 1, "net_price": 2000.0, "vat_rate": 22}],
+        }))
+
+    error = json.loads(result[0].text)["error"]
+    assert "2440.0" in error and "1220.0" in error

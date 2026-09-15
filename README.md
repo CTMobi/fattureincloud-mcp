@@ -145,7 +145,7 @@ set_payment(document_id, document_type="issued"|"received", status="paid"|"not_p
             paid_date?, payment_account?, payment_index?)
 ```
 
-- `paid_date` defaults to today; with `status="not_paid"` the paid date and the account are cleared.
+- `paid_date` defaults to today, or to the date already registered on the installment when there is one, so replaying the call does not move a payment. With `status="not_paid"` the paid date and the account are cleared.
 - `payment_account` accepts either the numeric id or the account name (case-insensitive, unique substrings work). Run `list_payment_accounts` to see what is configured. Without an account the payment is registered but does not land in FattureInCloud's cash flow.
 - **Installments:** documents with a single installment need no `payment_index`. With more than one, the call is refused and returns the installment list (index, amount, due date) so you can pick — or pass `payment_index="all"` to settle every installment at once.
 

@@ -13,7 +13,7 @@ MCP server that connects Claude (Desktop, Code, or any MCP client) to **FattureI
 
 > ⚠️ **Unofficial integration.** Not affiliated with, endorsed by, or sponsored by TeamSystem S.p.A., owner of the FattureInCloud trademark. The trademark is used here for descriptive purposes only.
 
-## Features (23 tools)
+## Features (25 tools)
 
 | Tool | Description |
 |------|-------------|
@@ -38,10 +38,11 @@ MCP server that connects Claude (Desktop, Code, or any MCP client) to **FattureI
 | `get_received_document` | Full detail of a received document by ID |
 | `create_received_document` | Create a passive document / expense (optional `cost_center`) |
 | `list_cost_centers` | List configured cost / revenue centers |
+| `list_payment_accounts` | List configured payment accounts (banks, cash, cards) |
+| `set_payment` | Register / clear a payment on an issued or received document |
 | `get_situation` | Yearly dashboard: net revenue, collected, outstanding, costs, margin |
 | `check_numeration` | Verify invoice numbering continuity |
 
-> Marking payments as "paid" is intentionally not exposed: the FattureInCloud API requires a payment account that cannot be reliably retrieved through the SDK. Use the FattureInCloud web panel for that operation.
 
 ## Installation
 
@@ -125,7 +126,7 @@ Claude will:
 
 ## Caching
 
-To minimize redundant calls to the FattureInCloud API, this server caches client lookups and the cost-centers list locally as JSON files (default location `~/.fattureincloud-mcp/cache/`, scoped per `company_id`, 24-hour TTL). The cache is transparent: tool signatures don't change.
+To minimize redundant calls to the FattureInCloud API, this server caches client lookups, the cost-centers list and the payment accounts locally as JSON files (default location `~/.fattureincloud-mcp/cache/`, scoped per `company_id`, 24-hour TTL). The cache is transparent: tool signatures don't change.
 
 ```bash
 # Force refresh:
@@ -134,6 +135,21 @@ rm -rf ~/.fattureincloud-mcp/cache
 # Disable temporarily:
 export FIC_CACHE_DISABLED=1
 ```
+
+## Payments (incassi and pagamenti)
+
+`set_payment` registers an incasso on an issued document or a pagamento on a received one. Unlike `update_document`, it also works on documents already sent to SDI — collecting an invoice after it cleared the SDI is the normal case.
+
+```
+set_payment(document_id, document_type="issued"|"received", status="paid"|"not_paid",
+            paid_date?, payment_account?, payment_index?)
+```
+
+- `paid_date` defaults to today; with `status="not_paid"` the paid date and the account are cleared.
+- `payment_account` accepts either the numeric id or the account name (case-insensitive, unique substrings work). Run `list_payment_accounts` to see what is configured. Without an account the payment is registered but does not land in FattureInCloud's cash flow.
+- **Installments:** documents with a single installment need no `payment_index`. With more than one, the call is refused and returns the installment list (index, amount, due date) so you can pick — or pass `payment_index="all"` to settle every installment at once.
+
+Once a payment is registered, `update_document` refuses any edit that would change the document total or the installment plan, and points back to `set_payment`: rewriting the schedule under a registered payment would report cash that was never collected. Edits that leave the total untouched (subject, line descriptions, a new due date on a single installment) keep working.
 
 ## Cost / Revenue Centers
 

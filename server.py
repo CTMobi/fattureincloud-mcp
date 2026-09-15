@@ -125,6 +125,105 @@ def fetch_revenue_centers(*, company_id):
         return []
 
 
+@cache.cached("payment_accounts", ttl=timedelta(hours=24))
+def fetch_payment_accounts(*, company_id):
+    """Payment accounts (FIC `/info/payment_accounts`). Used to resolve the
+    `payment_account` argument of `set_payment` by id or by name."""
+    try:
+        response = info_api.list_payment_accounts(company_id=company_id)
+    except Exception:
+        return []
+    accounts = []
+    for a in (response.data or []):
+        d = a.to_dict() if hasattr(a, "to_dict") else dict(a)
+        acc_type = str(d.get("type") or "").split(".")[-1].lower()
+        accounts.append({
+            "id": d.get("id"),
+            "name": d.get("name"),
+            "type": acc_type or None,
+            "virtual": d.get("virtual"),
+        })
+    return accounts
+
+
+def resolve_payment_account(value):
+    """Resolve a `payment_account` argument (numeric id or account name)
+    against the cached account list. Returns (account, error_message)."""
+    accounts = fetch_payment_accounts(company_id=COMPANY_ID)
+    names = [a["name"] for a in accounts]
+
+    if isinstance(value, int) and not isinstance(value, bool) or \
+            (isinstance(value, str) and value.strip().isdigit()):
+        wanted = int(value)
+        for a in accounts:
+            if a["id"] == wanted:
+                return a, None
+        return None, f"payment_account con id {wanted} non esiste. Disponibili: {names}."
+
+    wanted = str(value).strip().lower()
+    exact = [a for a in accounts if (a["name"] or "").strip().lower() == wanted]
+    if len(exact) == 1:
+        return exact[0], None
+    partial = [a for a in accounts if wanted and wanted in (a["name"] or "").lower()]
+    if len(partial) == 1:
+        return partial[0], None
+    if len(partial) > 1:
+        return None, f"payment_account '{value}' ambiguo: {[a['name'] for a in partial]}."
+    return None, f"payment_account '{value}' non esiste. Disponibili: {names}."
+
+
+def _enum_value(value):
+    """Plain wire value of an SDK enum member ('IssuedDocumentType.CREDIT_NOTE'
+    -> 'credit_note'); passes plain strings through."""
+    if value is None:
+        return None
+    return str(value).split(".")[-1].lower()
+
+
+def _payment_status(p):
+    """Normalized payment status: 'paid', 'not_paid' or 'reversed'. The SDK
+    returns either a plain string or an enum repr depending on the endpoint."""
+    raw = p.get("status")
+    if raw is None:
+        return ""
+    return str(raw).split(".")[-1].lower()
+
+
+def _payment_entry(p):
+    """Serialize one payments_list entry read from the API into a JSON-safe
+    payload the FIC modify endpoints accept back unchanged."""
+    entry = {
+        "amount": p.get("amount"),
+        "due_date": str(p.get("due_date"))[:10] if p.get("due_date") else None,
+        "status": _payment_status(p) or "not_paid",
+    }
+    if p.get("id"):
+        entry["id"] = p["id"]
+    if entry["status"] == "paid" and p.get("paid_date"):
+        entry["paid_date"] = str(p["paid_date"])[:10]
+    account = p.get("payment_account")
+    if hasattr(account, "to_dict"):
+        account = account.to_dict()
+    if isinstance(account, dict) and account.get("id"):
+        entry["payment_account"] = {"id": account["id"]}
+    terms = p.get("payment_terms")
+    if hasattr(terms, "to_dict"):
+        terms = terms.to_dict()
+    if isinstance(terms, dict):
+        terms = {k: v for k, v in terms.items() if v is not None}
+        if terms:
+            entry["payment_terms"] = terms
+    if p.get("ei_raw"):
+        entry["ei_raw"] = p["ei_raw"]
+    return entry
+
+
+def _error(message, **extra):
+    payload = {"success": False, "error": message}
+    payload.update(extra)
+    return [TextContent(type="text", text=json.dumps(payload, indent=2, ensure_ascii=False))]
+
+
 def build_entity_from_client(client_id, client_data=None):
     if not client_data:
         client_data = get_client_by_id(client_id)
@@ -425,7 +524,7 @@ async def list_tools():
         ),
         Tool(
             name="update_document",
-            description="Modifica parziale di un documento BOZZA (fattura, NDC, proforma). Passa solo i campi da aggiornare. Funziona solo su documenti non ancora inviati allo SDI. IMPORTANTE: Chiedere sempre conferma all'utente prima di eseguire.",
+            description="Modifica parziale di un documento BOZZA (fattura, NDC, proforma). Passa solo i campi da aggiornare. Funziona solo su documenti non ancora inviati allo SDI. Se il documento ha pagamenti già registrati, le modifiche che cambierebbero il totale o il piano rate vengono rifiutate: azzerare prima il pagamento con set_payment. IMPORTANTE: Chiedere sempre conferma all'utente prima di eseguire.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -564,6 +663,48 @@ async def list_tools():
             annotations=_ann(read_only=True, idempotent=True),
         ),
         Tool(
+            name="list_payment_accounts",
+            description="Lista dei conti di pagamento configurati in FattureInCloud (banche, casse, carte). Serve per valorizzare `payment_account` in set_payment. Read-only.",
+            inputSchema={"type": "object", "properties": {}},
+            annotations=_ann(read_only=True, idempotent=True),
+        ),
+        Tool(
+            name="set_payment",
+            description=(
+                "Registra un incasso (documento emesso) o un pagamento (documento ricevuto) "
+                "sulle scadenze del documento. Funziona anche su fatture già inviate allo SDI. "
+                "Se il documento ha più rate serve payment_index: l'indice della rata, oppure "
+                "\"all\" per saldarle tutte. IMPORTANTE: Chiedere sempre conferma all'utente prima di eseguire."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "document_id": {"type": "integer", "description": "ID del documento"},
+                    "document_type": {
+                        "type": "string",
+                        "enum": ["issued", "received"],
+                        "description": "issued = documento emesso (incasso), received = documento ricevuto (pagamento)"
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["paid", "not_paid"],
+                        "description": "paid = registra incasso/pagamento, not_paid = annulla la registrazione"
+                    },
+                    "paid_date": {"type": "string", "description": "Data incasso/pagamento YYYY-MM-DD (default: oggi). Ignorata con status not_paid"},
+                    "payment_account": {
+                        "type": ["string", "integer"],
+                        "description": "Conto su cui registrare: id numerico o nome (vedi list_payment_accounts). Opzionale"
+                    },
+                    "payment_index": {
+                        "type": ["integer", "string"],
+                        "description": "Indice della rata (0-based) oppure \"all\" per tutte. Obbligatorio se il documento ha più rate"
+                    }
+                },
+                "required": ["document_id", "document_type", "status"]
+            },
+            annotations=_ann(idempotent=True),
+        ),
+        Tool(
             name="get_received_document",
             description="Dettaglio fattura passiva (ricevuta da fornitore) per ID. Read-only.",
             inputSchema={
@@ -660,7 +801,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 payments.append({
                     "amount": p.get("amount"),
                     "due_date": str(p.get("due_date", "")),
-                    "status": str(p.get("status", "")).replace("IssuedDocumentStatus.", ""),
+                    "status": _payment_status(p),
                     "paid_date": str(p.get("paid_date", "")) if p.get("paid_date") else None,
                     "payment_account_id": pa.get("id") if isinstance(pa, dict) else None
                 })
@@ -987,21 +1128,60 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                         "error": f"revenue_center '{revenue_center}' non esiste. Disponibili: {known}."
                     }, ensure_ascii=False))]
 
+            # Payments carry the registered incasso (status/paid_date/payment_account).
+            # Rebuilding them unconditionally wipes it and collapses N installments
+            # into one, so rebuild only when the schedule or the total really moved
+            # (argument presence is not enough: clients echo back unchanged fields).
+            existing_payments = [_payment_entry(p) for p in (orig.get("payments_list") or [])]
+            existing_total = round(sum(p.get("amount") or 0 for p in existing_payments), 2)
+            orig_days = ((orig.get("payments_list") or [{}])[0].get("payment_terms") or {}).get("days") or 30
+            schedule_moved = (
+                date_str[:10] != str(orig.get("date", ""))[:10]
+                or payment_days != orig_days
+            )
+            total_moved = round(total_abs, 2) != existing_total
+            registered = [p for p in existing_payments if p.get("status") != "not_paid"]
+
+            if existing_payments and not (schedule_moved or total_moved):
+                payments_list = existing_payments
+            elif registered and (total_moved or len(existing_payments) > 1):
+                return _error(
+                    f"Il documento ha {len(registered)} rata/e con pagamento registrato: "
+                    "modificarne importo o piano rate riscriverebbe un incasso già contabilizzato. "
+                    "Azzera prima il pagamento con set_payment (status='not_paid'), oppure "
+                    "modifica il documento dal pannello FattureInCloud.",
+                    payments=[
+                        {"index": i, "amount": p.get("amount"), "due_date": p.get("due_date"),
+                         "status": p.get("status")}
+                        for i, p in enumerate(existing_payments)
+                    ],
+                )
+            elif registered:
+                # single settled installment, same total: only the due date moves
+                payment = dict(existing_payments[0])
+                payment["due_date"] = due_date.strftime("%Y-%m-%d")
+                payment["payment_terms"] = {"days": payment_days, "type": "standard"}
+                payments_list = [payment]
+            else:
+                payments_list = [{
+                    "amount": round(total_abs, 2),
+                    "due_date": due_date.strftime("%Y-%m-%d"),
+                    "status": "not_paid",
+                    "payment_terms": {"days": payment_days, "type": "standard"}
+                }]
+
             body_data = {
                 "type": doc_type,
                 "entity": entity,
                 "date": date_str[:10],
                 "visible_subject": visible_subject,
                 "items_list": items_list,
-                "payments_list": [{
-                    "amount": round(total_abs, 2),
-                    "due_date": due_date.strftime("%Y-%m-%d"),
-                    "status": "not_paid",
-                    "payment_terms": {"days": payment_days, "type": "standard"}
-                }]
+                "payments_list": payments_list
             }
             if revenue_center:
                 body_data["rc_center"] = revenue_center
+            if orig.get("show_totals"):
+                body_data["show_totals"] = _enum_value(orig["show_totals"])
             if doc_type in ("invoice", "credit_note"):
                 body_data["e_invoice"] = True
                 body_data["ei_data"] = {"payment_method": "MP05"}
@@ -1261,7 +1441,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     continue
                 totale_fatturato += get_total_from_doc(d)
                 for p in d.get('payments_list', []):
-                    status = str(p.get('status', '')).replace('IssuedDocumentStatus.', '')
+                    status = _payment_status(p)
                     if status == 'paid':
                         totale_incassato += p.get('amount', 0)
                     elif status == 'not_paid':
@@ -1356,6 +1536,151 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             centers = sorted(set(cost) | set(revenue))
             return [TextContent(type="text", text=json.dumps(centers, indent=2, ensure_ascii=False))]
 
+        elif name == "list_payment_accounts":
+            accounts = fetch_payment_accounts(company_id=COMPANY_ID)
+            return [TextContent(type="text", text=json.dumps(accounts, indent=2, ensure_ascii=False))]
+
+        elif name == "set_payment":
+            doc_id = arguments["document_id"]
+            doc_kind = arguments["document_type"]
+            status = arguments["status"]
+            if doc_kind not in ("issued", "received"):
+                return _error("document_type deve essere 'issued' o 'received'.")
+            if status not in ("paid", "not_paid"):
+                return _error("status deve essere 'paid' o 'not_paid'.")
+
+            account = None
+            if status == "paid" and arguments.get("payment_account") is not None:
+                account, account_error = resolve_payment_account(arguments["payment_account"])
+                if account_error:
+                    return _error(account_error)
+
+            if doc_kind == "issued":
+                response = issued_api.get_issued_document(
+                    company_id=COMPANY_ID, document_id=doc_id, fieldset="detailed"
+                )
+            else:
+                response = received_api.get_received_document(
+                    company_id=COMPANY_ID, document_id=doc_id, fieldset="detailed"
+                )
+            d = response.data.to_dict()
+
+            payments = [_payment_entry(p) for p in (d.get("payments_list") or [])]
+            if not payments:
+                if doc_kind == "issued":
+                    return _error(
+                        f"Documento {doc_id} senza scadenze di pagamento: impossibile registrare l'incasso."
+                    )
+                amount = d.get("amount_gross")
+                if amount is None:
+                    amount = (d.get("amount_net") or 0) + (d.get("amount_vat") or 0)
+                payments = [{
+                    "amount": amount,
+                    "due_date": str(d.get("date", ""))[:10],
+                    "status": "not_paid",
+                }]
+
+            index = arguments.get("payment_index")
+            last = len(payments) - 1
+            if index is None:
+                if len(payments) > 1:
+                    return _error(
+                        f"{len(payments)} rate presenti: specifica payment_index (0-{last}) "
+                        f'oppure "all" per saldarle tutte.',
+                        payments=[
+                            {"index": i, "amount": p.get("amount"),
+                             "due_date": p.get("due_date"), "status": p.get("status")}
+                            for i, p in enumerate(payments)
+                        ],
+                    )
+                targets = [0]
+            elif isinstance(index, str) and index.strip().lower() == "all":
+                targets = list(range(len(payments)))
+            else:
+                try:
+                    wanted = int(index)
+                except (TypeError, ValueError):
+                    return _error('payment_index deve essere un intero oppure "all".')
+                if not 0 <= wanted <= last:
+                    return _error(
+                        f"payment_index {index} fuori intervallo: il documento ha "
+                        f"{len(payments)} rate (0-{last})."
+                    )
+                targets = [wanted]
+
+            paid_date = (arguments.get("paid_date") or datetime.now().strftime("%Y-%m-%d"))[:10]
+            for i in targets:
+                entry = payments[i]
+                entry["status"] = status
+                if status == "paid":
+                    entry["paid_date"] = paid_date
+                    if account:
+                        entry["payment_account"] = {"id": account["id"]}
+                else:
+                    entry.pop("paid_date", None)
+                    entry.pop("payment_account", None)
+
+            # The SDK request models default `type` (invoice / expense) and
+            # `show_totals`, and those defaults are serialized into the PUT: echo
+            # the document's own values so a credit note stays a credit note.
+            data = {"payments_list": payments}
+            if d.get("type"):
+                data["type"] = _enum_value(d["type"])
+            if doc_kind == "issued" and d.get("show_totals"):
+                data["show_totals"] = _enum_value(d["show_totals"])
+            body = {"data": data}
+            if doc_kind == "issued":
+                response = issued_api.modify_issued_document(
+                    company_id=COMPANY_ID, document_id=doc_id,
+                    modify_issued_document_request=body
+                )
+            else:
+                response = received_api.modify_received_document(
+                    company_id=COMPANY_ID, document_id=doc_id,
+                    modify_received_document_request=body
+                )
+            updated = response.data.to_dict()
+
+            account_names = {a["id"]: a["name"] for a in fetch_payment_accounts(company_id=COMPANY_ID)}
+            totale_pagato = residuo = 0.0
+            view = []
+            for i, p in enumerate(updated.get("payments_list") or payments):
+                entry = _payment_entry(p)
+                amount = entry.get("amount") or 0
+                row = {
+                    "index": i,
+                    "amount": amount,
+                    "due_date": entry.get("due_date"),
+                    "status": entry.get("status"),
+                }
+                if entry.get("paid_date"):
+                    row["paid_date"] = entry["paid_date"]
+                if entry.get("payment_account"):
+                    account_id = entry["payment_account"]["id"]
+                    row["payment_account"] = {"id": account_id, "name": account_names.get(account_id)}
+                if entry.get("status") == "paid":
+                    totale_pagato += amount
+                else:
+                    residuo += amount
+                view.append(row)
+
+            number = updated.get("number") or d.get("number") or d.get("invoice_number")
+            counterparty = (updated.get("entity") or d.get("entity") or {}).get("name")
+            verb = "Incasso" if doc_kind == "issued" else "Pagamento"
+            azione = "registrato" if status == "paid" else "annullato"
+            result = {
+                "success": True,
+                "id": d.get("id", doc_id),
+                "document_type": doc_kind,
+                "number": number,
+                "counterparty": counterparty,
+                "payments": view,
+                "totale_pagato": round(totale_pagato, 2),
+                "residuo": round(residuo, 2),
+                "message": f"{verb} {azione} su {len(targets)} rata/e del documento #{number}.",
+            }
+            return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
+
         elif name == "get_received_document":
             doc_id = arguments["document_id"]
             response = received_api.get_received_document(
@@ -1376,7 +1701,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 payments.append({
                     "amount": p.get("amount"),
                     "due_date": str(p.get("due_date", "")),
-                    "status": str(p.get("status", "")).replace("ReceivedDocumentStatus.", ""),
+                    "status": _payment_status(p),
                     "paid_date": str(p.get("paid_date", "")) if p.get("paid_date") else None,
                 })
             result = {

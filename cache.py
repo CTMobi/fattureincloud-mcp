@@ -81,7 +81,10 @@ def cached(resource: str, ttl: timedelta = timedelta(hours=24)):
             if hit is not None:
                 return hit
             value = fn(*args, company_id=company_id, **kwargs)
-            put(resource, company_id, value)
+            # An empty result is indistinguishable from a failed fetch, and
+            # persisting it would serve that failure for the whole TTL.
+            if value:
+                put(resource, company_id, value)
             return value
         return wrapper
     return decorator

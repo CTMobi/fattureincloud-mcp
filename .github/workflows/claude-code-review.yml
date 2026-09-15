@@ -1,0 +1,74 @@
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+
+# Push ravvicinati sulla stessa PR annullano la review precedente: evita run
+# in race sul commento track_progress e quota sprecata (utile con synchronize).
+concurrency:
+  group: claude-code-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  claude-review:
+    # Gira solo per PR dallo STESSO repo (non da fork esterni): un branch nel
+    # repo può crearlo solo chi ha permessi di push (team interno), mentre i
+    # contributor esterni devono forkare, e sui fork il workflow `pull_request`
+    # non riceve i secret. NB1: non usiamo `head.repo.fork` perché questo repo è
+    # esso stesso un fork (sarebbe sempre true). NB2: non filtriamo su
+    # `author_association` perché i membri con iscrizione all'org PRIVATA
+    # risultano `CONTRIBUTOR` (non `MEMBER`) nel payload dell'evento e
+    # verrebbero erroneamente esclusi.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    # Una review non deve superare ~15 min: evita che un run bloccato
+    # (rete/quota/bug dell'action) consumi minuti runner fino al default di 6h.
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write   # serve per track_progress e commenti inline
+      issues: write          # per leggere/commentare issue collegate alla PR
+      id-token: write
+      actions: read          # per leggere i risultati CI sulla PR
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # fetch-depth: 0 -> la action fa `git fetch` del branch della PR per
+          # calcolare il diff; serve la storia completa e le credenziali
+          # persistite (NON usare persist-credentials: false, romperebbe il
+          # fetch sui repo privati).
+          fetch-depth: 0
+
+      - name: Run Claude Code Review
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+
+          # Rende effettivo il permesso job-level `actions: read`: senza questo
+          # input Claude non può leggere i risultati CI della PR.
+          additional_permissions: |
+            actions: read
+
+          # Commento con checklist di avanzamento che si aggiorna durante la review
+          track_progress: true
+
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            Esegui una review di questa pull request, in italiano, con focus su:
+            1. Qualità e leggibilità (best practice, gestione errori, edge case)
+            2. Sicurezza (input non validati, secret esposti, permessi)
+            3. Correttezza e performance
+            4. Test (copertura adeguata, casi mancanti)
+            5. Documentazione (README/skill coerenti con le modifiche)
+
+            Usa commenti inline per problemi puntuali sulle righe.
+            Usa un commento top-level per osservazioni generali o apprezzamenti.
+            Sii conciso: segnala solo ciò che conta davvero, evita rumore.
+
+          claude_args: |
+            --model opus
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"

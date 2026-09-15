@@ -149,7 +149,7 @@ set_payment(document_id, document_type="issued"|"received", status="paid"|"not_p
 - `payment_account` accepts either the numeric id or the account name (case-insensitive, unique substrings work). Run `list_payment_accounts` to see what is configured. Without an account the payment is registered but does not land in FattureInCloud's cash flow.
 - **Installments:** documents with a single installment need no `payment_index`. With more than one, the call is refused and returns the installment list (index, amount, due date) so you can pick — or pass `payment_index="all"` to settle every installment at once.
 
-Once a payment is registered, `update_document` refuses any edit that would change the document total or the installment plan, and points back to `set_payment`: rewriting the schedule under a registered payment would report cash that was never collected. Edits that leave the total untouched (subject, line descriptions, a new due date on a single installment) keep working.
+`update_document` refuses any edit that would rewrite the payment schedule and points back to `set_payment`: documents with several installments (rebuilding would flatten a 30/60/90 plan into a single due date) and documents with a registered payment whose total would change (that would report cash that was never collected). Edits that leave the schedule alone — subject, line descriptions, a new due date on a single installment, or re-sending values that did not actually change — keep working.
 
 ## Cost / Revenue Centers
 

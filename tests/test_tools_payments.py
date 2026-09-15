@@ -571,31 +571,6 @@ def test_update_document_ignores_echoed_unchanged_fields(server_module):
     assert [p["status"] for p in sent] == ["paid", "not_paid"]
 
 
-def test_update_document_collapses_unregistered_installments(server_module):
-    """With nothing registered there is no money to lose: recomputing a new
-    single schedule stays allowed."""
-    server = server_module
-    doc = _issued_doc([
-        _rate(610.0, "2026-01-31"),
-        _rate(610.0, "2026-02-28"),
-    ])
-
-    with patch.object(server.issued_api, "get_issued_document",
-                      return_value=_doc_response(doc)), \
-         patch.object(server.issued_api, "modify_issued_document",
-                      return_value=_doc_response(doc)) as modify, \
-         patch.object(server, "get_client_by_id", return_value={"name": "Acme"}):
-        _run(server.call_tool("update_document", {
-            "document_id": 42,
-            "items": [{"name": "Item", "qty": 1, "net_price": 2000.0, "vat_rate": 22}],
-        }))
-
-    sent = _sent_payments(modify, "modify_issued_document_request")
-    assert len(sent) == 1
-    assert sent[0]["amount"] == 2440.0
-    assert sent[0]["status"] == "not_paid"
-
-
 # --------------------------------------------------------------------------
 # document identity must survive the PUT
 # --------------------------------------------------------------------------
@@ -787,3 +762,167 @@ def test_payment_accounts_api_failure_is_not_cached(server_module):
     with patch.object(server.info_api, "list_payment_accounts",
                       return_value=_accounts_response(ACCOUNTS)):
         assert server.fetch_payment_accounts(company_id=100) == ACCOUNTS
+
+
+# --------------------------------------------------------------------------
+# review round 2
+# --------------------------------------------------------------------------
+
+def test_update_document_keeps_immediate_payment_terms(server_module):
+    """`payment_terms.days = 0` (rimessa diretta) is a real term: it must not
+    be read back as 30 and trigger a phantom reschedule."""
+    server = server_module
+    doc = _issued_doc([
+        _rate(610.0, "2026-01-10", "paid", paid_date="2026-01-10",
+              payment_terms={"days": 0, "type": "standard"}),
+        _rate(610.0, "2026-01-10", payment_terms={"days": 0, "type": "standard"}),
+    ])
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document",
+                      return_value=_doc_response(doc)) as modify, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme"}):
+        result = _run(server.call_tool("update_document", {
+            "document_id": 42, "visible_subject": "Nuovo",
+        }))
+
+    assert json.loads(result[0].text)["success"] is True
+    sent = _sent_payments(modify, "modify_issued_document_request")
+    assert len(sent) == 2
+    assert sent[0]["due_date"] == "2026-01-10"
+    assert sent[0]["status"] == "paid"
+
+
+def test_update_document_on_credit_note_with_negative_payment(server_module):
+    """Credit note installments can carry negative amounts; comparing them
+    against the positive recomputed total must not read as a changed total."""
+    server = server_module
+    doc = _issued_doc([_rate(-1220.0, "2026-02-09", "paid", paid_date="2026-02-05")])
+    doc["type"] = "credit_note"
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document",
+                      return_value=_doc_response(doc)) as modify, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme"}):
+        result = _run(server.call_tool("update_document", {
+            "document_id": 42, "visible_subject": "Nuovo",
+        }))
+
+    assert modify.called
+    assert json.loads(result[0].text)["success"] is True
+    sent = _sent_payments(modify, "modify_issued_document_request")
+    assert sent[0]["amount"] == -1220.0
+    assert sent[0]["status"] == "paid"
+
+
+def test_update_document_refuses_to_collapse_an_installment_plan(server_module):
+    """A 30/60/90 plan must not disappear silently on an unrelated edit."""
+    server = server_module
+    doc = _issued_doc([
+        _rate(406.67, "2026-01-31"),
+        _rate(406.67, "2026-02-28"),
+        _rate(406.66, "2026-03-31"),
+    ])
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document") as modify, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme"}):
+        result = _run(server.call_tool("update_document", {
+            "document_id": 42, "date": "2026-02-01",
+        }))
+
+    assert not modify.called
+    payload = json.loads(result[0].text)
+    assert payload["success"] is False
+    assert len(payload["payments"]) == 3
+
+
+def test_set_payment_rejects_malformed_paid_date(server_module):
+    server = server_module
+    doc = _issued_doc([_rate(1220.0, "2026-02-09")])
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document") as modify:
+        result = _run(server.call_tool("set_payment", {
+            "document_id": 42, "document_type": "issued", "status": "paid",
+            "paid_date": "05/02/2026",
+        }))
+
+    assert not modify.called
+    payload = json.loads(result[0].text)
+    assert payload["success"] is False
+    assert "paid_date" in payload["error"]
+
+
+def test_set_payment_repeat_keeps_the_original_paid_date(server_module):
+    """The tool is annotated idempotent: replaying it without paid_date must
+    not move an already registered payment to today."""
+    server = server_module
+    doc = _issued_doc([_rate(1220.0, "2026-02-09", "paid", paid_date="2026-02-05")])
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document",
+                      return_value=_doc_response(doc)) as modify:
+        _run(server.call_tool("set_payment", {
+            "document_id": 42, "document_type": "issued", "status": "paid",
+        }))
+
+    sent = _sent_payments(modify, "modify_issued_document_request")
+    assert sent[0]["paid_date"] == "2026-02-05"
+
+
+def test_set_payment_issued_without_installments_is_rejected(server_module):
+    server = server_module
+    doc = _issued_doc([])
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document") as modify:
+        result = _run(server.call_tool("set_payment", {
+            "document_id": 42, "document_type": "issued", "status": "paid",
+        }))
+
+    assert not modify.called
+    assert json.loads(result[0].text)["success"] is False
+
+
+def test_set_payment_rejects_non_numeric_payment_index(server_module):
+    server = server_module
+    doc = _issued_doc([_rate(1220.0, "2026-02-09")])
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document") as modify:
+        result = _run(server.call_tool("set_payment", {
+            "document_id": 42, "document_type": "issued", "status": "paid",
+            "payment_index": "prima",
+        }))
+
+    assert not modify.called
+    assert "payment_index" in json.loads(result[0].text)["error"]
+
+
+def test_get_situation_counts_reversed_as_outstanding(server_module):
+    """A reversed payment was not collected: it belongs to da_incassare, not
+    to nowhere."""
+    server = server_module
+    doc = _issued_doc([_rate(1220.0, "2026-02-09", "reversed")])
+    listed = MagicMock()
+    listed.data = [MagicMock(**{"to_dict.return_value": doc})]
+    empty = MagicMock()
+    empty.data = []
+
+    with patch.object(server.issued_api, "list_issued_documents",
+                      side_effect=[listed, empty]), \
+         patch.object(server.received_api, "list_received_documents", return_value=empty):
+        result = _run(server.call_tool("get_situation", {"year": 2026}))
+
+    payload = json.loads(result[0].text)
+    assert payload["incassato"] == 0.0
+    assert payload["da_incassare"] == 1220.0
+    assert [s["amount"] for s in payload["prossime_scadenze"]] == [1220.0]

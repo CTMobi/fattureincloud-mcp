@@ -524,7 +524,7 @@ async def list_tools():
         ),
         Tool(
             name="update_document",
-            description="Modifica parziale di un documento BOZZA (fattura, NDC, proforma). Passa solo i campi da aggiornare. Funziona solo su documenti non ancora inviati allo SDI. Se il documento ha pagamenti già registrati, le modifiche che cambierebbero il totale o il piano rate vengono rifiutate: azzerare prima il pagamento con set_payment. IMPORTANTE: Chiedere sempre conferma all'utente prima di eseguire.",
+            description="Modifica parziale di un documento BOZZA (fattura, NDC, proforma). Passa solo i campi da aggiornare. Funziona solo su documenti non ancora inviati allo SDI. Rifiuta le modifiche che riscriverebbero lo scadenzario: documenti con più rate, o con pagamenti già registrati di cui cambierebbe il totale. In quei casi azzerare prima il pagamento con set_payment, o modificare il documento dal pannello FattureInCloud. IMPORTANTE: Chiedere sempre conferma all'utente prima di eseguire.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -693,7 +693,7 @@ async def list_tools():
                     "paid_date": {"type": "string", "description": "Data incasso/pagamento YYYY-MM-DD (default: oggi). Ignorata con status not_paid"},
                     "payment_account": {
                         "type": ["string", "integer"],
-                        "description": "Conto su cui registrare: id numerico o nome (vedi list_payment_accounts). Opzionale"
+                        "description": "Conto su cui registrare: id numerico o nome (vedi list_payment_accounts). Opzionale; ignorato con status not_paid"
                     },
                     "payment_index": {
                         "type": ["integer", "string"],
@@ -1134,20 +1134,29 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             # (argument presence is not enough: clients echo back unchanged fields).
             existing_payments = [_payment_entry(p) for p in (orig.get("payments_list") or [])]
             existing_total = round(sum(p.get("amount") or 0 for p in existing_payments), 2)
-            orig_days = ((orig.get("payments_list") or [{}])[0].get("payment_terms") or {}).get("days") or 30
+            orig_terms = ((orig.get("payments_list") or [{}])[0].get("payment_terms") or {})
+            orig_days = 30 if orig_terms.get("days") is None else orig_terms["days"]
             schedule_moved = (
                 date_str[:10] != str(orig.get("date", ""))[:10]
                 or payment_days != orig_days
             )
-            total_moved = round(total_abs, 2) != existing_total
+            # Credit note installments can be stored negative while total_abs is
+            # always positive: only the magnitude tells whether the total moved.
+            total_moved = round(total_abs, 2) != abs(existing_total)
             registered = [p for p in existing_payments if p.get("status") != "not_paid"]
 
             if existing_payments and not (schedule_moved or total_moved):
                 payments_list = existing_payments
-            elif registered and (total_moved or len(existing_payments) > 1):
+            elif (registered and total_moved) or len(existing_payments) > 1:
+                reason = (
+                    f"ha {len(registered)} rata/e con pagamento registrato: modificarne importo "
+                    "o scadenze riscriverebbe un incasso già contabilizzato"
+                    if registered else
+                    f"ha un piano di {len(existing_payments)} rate: ricostruirlo lo ridurrebbe "
+                    "a un'unica scadenza, perdendo la rateizzazione"
+                )
                 return _error(
-                    f"Il documento ha {len(registered)} rata/e con pagamento registrato: "
-                    "modificarne importo o piano rate riscriverebbe un incasso già contabilizzato. "
+                    f"Il documento {reason}. "
                     "Azzera prima il pagamento con set_payment (status='not_paid'), oppure "
                     "modifica il documento dal pannello FattureInCloud.",
                     payments=[
@@ -1444,7 +1453,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     status = _payment_status(p)
                     if status == 'paid':
                         totale_incassato += p.get('amount', 0)
-                    elif status == 'not_paid':
+                    else:  # not_paid, reversed, or anything FIC adds later
                         fatture_non_pagate.append({
                             "number": d.get("number"),
                             "client": client_name,
@@ -1609,11 +1618,20 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 targets = [wanted]
 
             paid_date = (arguments.get("paid_date") or datetime.now().strftime("%Y-%m-%d"))[:10]
+            try:
+                datetime.strptime(paid_date, "%Y-%m-%d")
+            except ValueError:
+                return _error(
+                    f"paid_date '{arguments.get('paid_date')}' non valida: usa il formato YYYY-MM-DD."
+                )
+
             for i in targets:
                 entry = payments[i]
                 entry["status"] = status
                 if status == "paid":
-                    entry["paid_date"] = paid_date
+                    # replaying the call must not move an already registered payment
+                    if arguments.get("paid_date") or not entry.get("paid_date"):
+                        entry["paid_date"] = paid_date
                     if account:
                         entry["payment_account"] = {"id": account["id"]}
                 else:

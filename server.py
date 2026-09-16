@@ -440,6 +440,17 @@ def _strip_local_fields(items):
 def build_issued_document(doc_type, client_id, items_data, date_str, payment_days,
                           visible_subject, negate_prices=False, source_invoice_id=None,
                           revenue_center=None):
+    if payment_days is None:
+        payment_days = 30
+    if isinstance(payment_days, bool) or not isinstance(payment_days, int):
+        return None, f"payment_days = {payment_days!r}: serve un intero (giorni)."
+    date_str = str(date_str or datetime.now().strftime("%Y-%m-%d"))[:10]
+    try:
+        invoice_date = datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        return None, f"date '{date_str}' non valida: usa il formato YYYY-MM-DD."
+    date_str = invoice_date.strftime("%Y-%m-%d")
+
     client_data = get_client_by_id(client_id)
     if not client_data:
         return None, f"Cliente con ID {client_id} non trovato"
@@ -457,7 +468,6 @@ def build_issued_document(doc_type, client_id, items_data, date_str, payment_day
     if items_error:
         return None, items_error
 
-    invoice_date = datetime.strptime(date_str, "%Y-%m-%d")
     due_date = invoice_date + timedelta(days=payment_days)
     total_abs = sum(
         abs(_item_net(i)) * (1 + _vat_value(i) / 100)
@@ -906,7 +916,7 @@ async def list_tools():
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "supplier_name": {"type": "string", "description": "Nome/Ragione sociale del fornitore"},
+                    "supplier_name": {"type": "string", "minLength": 1, "description": "Nome/Ragione sociale del fornitore"},
                     "supplier_vat_number": {"type": "string", "description": "Partita IVA del fornitore (opzionale)"},
                     "type": {
                         "type": "string",
@@ -1125,8 +1135,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 doc_type="invoice",
                 client_id=arguments["client_id"],
                 items_data=arguments["items"],
-                date_str=arguments.get("date", datetime.now().strftime("%Y-%m-%d")),
-                payment_days=arguments.get("payment_days", 30),
+                date_str=arguments.get("date"),
+                payment_days=arguments.get("payment_days"),
                 visible_subject=arguments.get("visible_subject", ""),
                 revenue_center=arguments.get("revenue_center"),
             )
@@ -1140,8 +1150,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 doc_type="credit_note",
                 client_id=arguments["client_id"],
                 items_data=arguments["items"],
-                date_str=arguments.get("date", datetime.now().strftime("%Y-%m-%d")),
-                payment_days=arguments.get("payment_days", 30),
+                date_str=arguments.get("date"),
+                payment_days=arguments.get("payment_days"),
                 visible_subject=arguments.get("visible_subject", ""),
                 negate_prices=True,
                 source_invoice_id=arguments.get("source_invoice_id"),
@@ -1163,8 +1173,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 doc_type="proforma",
                 client_id=arguments["client_id"],
                 items_data=arguments["items"],
-                date_str=arguments.get("date", datetime.now().strftime("%Y-%m-%d")),
-                payment_days=arguments.get("payment_days", 30),
+                date_str=arguments.get("date"),
+                payment_days=arguments.get("payment_days"),
                 visible_subject=arguments.get("visible_subject", ""),
                 revenue_center=arguments.get("revenue_center"),
             )
@@ -1483,7 +1493,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     }, ensure_ascii=False))]
 
             body_data = {
-                "type": "invoice", "e_invoice": True, "ei_data": {"payment_method": "MP05"},
+                "type": "invoice",
+                "e_invoice": bool(orig.get("e_invoice", True)),
                 "entity": entity, "date": new_date_str, "visible_subject": visible_subject,
                 "items_list": items_list,
                 "payments_list": [{"amount": round(total_gross, 2),
@@ -1491,6 +1502,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                                    "status": "not_paid",
                                    "payment_terms": {"days": payment_days, "type": payment_terms_type}}]
             }
+            if body_data["e_invoice"]:
+                body_data["ei_data"] = {
+                    "payment_method": (
+                        (orig.get("ei_data") or {}).get("payment_method")
+                        or (orig.get("payment_method") or {}).get("ei_payment_method")
+                        or "MP05"
+                    )
+                }
             if revenue_center:
                 body_data["rc_center"] = revenue_center
             body = {"data": body_data}
@@ -1783,7 +1802,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             if status == "paid" and arguments.get("paid_date") is not None:
                 paid_date = str(arguments["paid_date"]).strip()
                 try:
-                    datetime.strptime(paid_date, "%Y-%m-%d")
+                    paid_date = datetime.strptime(paid_date, "%Y-%m-%d").strftime("%Y-%m-%d")
                 except ValueError:
                     return _error(
                         f"paid_date '{arguments['paid_date']}' non valida: usa il formato YYYY-MM-DD."
@@ -2019,7 +2038,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 if isinstance(value, bool) or not isinstance(value, (int, float)):
                     return _error(f"{field} = {value!r}: serve un numero.")
 
-            date_str = arguments.get("date", datetime.now().strftime("%Y-%m-%d"))
+            date_str = str(arguments.get("date") or datetime.now().strftime("%Y-%m-%d"))[:10]
+            try:
+                date_str = datetime.strptime(date_str, "%Y-%m-%d").strftime("%Y-%m-%d")
+            except ValueError:
+                return _error(f"date '{arguments.get('date')}' non valida: usa il formato YYYY-MM-DD.")
 
             entity = {"name": arguments["supplier_name"]}
             if arguments.get("supplier_vat_number"):

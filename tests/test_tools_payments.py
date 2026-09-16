@@ -1993,3 +1993,94 @@ def test_create_received_document_treats_a_null_vat_as_zero(server_module):
 
     assert json.loads(result[0].text)["success"] is True
     assert create.call_args.kwargs["create_received_document_request"]["data"]["amount_gross"] == 100.0
+
+
+# --------------------------------------------------------------------------
+# review round 14
+# --------------------------------------------------------------------------
+
+def test_create_invoice_treats_null_date_and_payment_days_as_absent(server_module):
+    server = server_module
+    created = MagicMock()
+    created.data.to_dict.return_value = {"id": 1, "number": 1, "date": "2026-01-10"}
+
+    with patch.object(server.issued_api, "create_issued_document", return_value=created) as create, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme", "ei_code": "A1"}):
+        result = _run(server.call_tool("create_invoice", {
+            "client_id": 5, "date": None, "payment_days": None, "visible_subject": "Test",
+            "items": [{"name": "Item", "qty": 1, "net_price": 100.0}],
+        }))
+
+    assert json.loads(result[0].text)["success"] is True
+    assert create.called
+
+
+@pytest.mark.parametrize("date_value", ["10/02/2026", "oggi", "2026-13-01"])
+def test_create_invoice_rejects_a_malformed_date(server_module, date_value):
+    """set_payment answers with a message for the same spelling; here it was a
+    ValueError from the generic handler, after three reads."""
+    server = server_module
+
+    with patch.object(server.issued_api, "create_issued_document") as create, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme", "ei_code": "A1"}):
+        result = _run(server.call_tool("create_invoice", {
+            "client_id": 5, "date": date_value, "visible_subject": "Test",
+            "items": [{"name": "Item", "qty": 1, "net_price": 100.0}],
+        }))
+
+    assert not create.called
+    payload = json.loads(result[0].text)
+    assert payload["success"] is False
+    assert "date" in payload["error"]
+
+
+def test_create_received_document_rejects_a_malformed_date(server_module):
+    server = server_module
+
+    with patch.object(server.received_api, "create_received_document") as create:
+        result = _run(server.call_tool("create_received_document", {
+            "supplier_name": "Supplier Srl", "amount_net": 100.0, "date": "10/02/2026",
+        }))
+
+    assert not create.called
+    assert json.loads(result[0].text)["success"] is False
+
+
+def test_duplicate_invoice_preserves_e_invoice_and_payment_method(server_module):
+    """A copy that changes the payment method changes what the XML declares."""
+    server = server_module
+    doc = _issued_doc([_rate(1220.0, "2026-02-09")])
+    doc["e_invoice"] = False
+    doc["ei_data"] = {"payment_method": "MP19"}
+    created = MagicMock()
+    created.data.to_dict.return_value = {"id": 2, "number": 9, "date": "2026-03-01"}
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "create_issued_document",
+                      return_value=created) as create, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme", "ei_code": "A1"}):
+        _run(server.call_tool("duplicate_invoice", {
+            "source_document_id": 42, "new_date": "2026-03-01",
+        }))
+
+    body = create.call_args.kwargs["create_issued_document_request"]["data"]
+    assert body["e_invoice"] is False
+    assert "ei_data" not in body
+
+
+def test_create_invoice_normalizes_an_unpadded_date(server_module):
+    """strptime accepts "2026-2-5": send FIC the padded form rather than
+    whatever the client typed."""
+    server = server_module
+    created = MagicMock()
+    created.data.to_dict.return_value = {"id": 1, "number": 1, "date": "2026-02-05"}
+
+    with patch.object(server.issued_api, "create_issued_document", return_value=created) as create, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme", "ei_code": "A1"}):
+        _run(server.call_tool("create_invoice", {
+            "client_id": 5, "date": "2026-2-5", "visible_subject": "Test",
+            "items": [{"name": "Item", "qty": 1, "net_price": 100.0}],
+        }))
+
+    assert create.call_args.kwargs["create_issued_document_request"]["data"]["date"] == "2026-02-05"

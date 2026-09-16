@@ -227,10 +227,13 @@ def _payment_terms_of(doc):
 
 
 def _payment_days_of(doc):
-    """Payment-term days of a document's first installment. FIC can return
-    `payment_terms: null` or `days: null`, and `days: 0` (rimessa diretta) is a
-    real term that must survive."""
+    """Payment-term days of a document's first installment, absorbed rather
+    than judged: this is what the document stores, not what a caller wrote.
+    `days: 0` (rimessa diretta) survives, an integral float is the same term,
+    and anything else — null, out of range — reads back as 30."""
     days = _payment_terms_of(doc).get("days")
+    if isinstance(days, float) and days.is_integer():
+        days = int(days)
     if isinstance(days, bool) or not isinstance(days, int) or not 0 <= days <= 3650:
         return 30
     return days
@@ -1444,7 +1447,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 # `ei_data` applies only to e-invoices, and the payment method is
                 # the document's own: overwriting it with MP05 on an unrelated
                 # edit would change what the XML declares.
-                body_data["e_invoice"] = bool(orig.get("e_invoice"))
+                body_data["e_invoice"] = True if orig.get("e_invoice") is None else bool(orig["e_invoice"])
                 if body_data["e_invoice"]:
                     ei_data = {k: v for k, v in (orig.get("ei_data") or {}).items() if v is not None}
                     payment_method = (

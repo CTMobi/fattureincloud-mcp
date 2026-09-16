@@ -2223,7 +2223,7 @@ def test_duplicate_invoice_treats_a_null_e_invoice_as_electronic(server_module):
 # review round 16
 # --------------------------------------------------------------------------
 
-@pytest.mark.parametrize("stored_days", [5000, 30.0, None])
+@pytest.mark.parametrize("stored_days", [5000, 45.0, None])
 def test_update_document_absorbs_a_stored_payment_days(server_module, stored_days):
     """The stored value is not an argument: refusing an unrelated edit and
     naming payment_days points at something the caller never sent."""
@@ -2286,3 +2286,47 @@ def test_duplicate_invoice_drops_null_ei_data_fields(server_module):
 
     ei_data = create.call_args.kwargs["create_issued_document_request"]["data"]["ei_data"]
     assert ei_data == {"payment_method": "MP19"}
+
+
+def test_update_document_treats_a_null_e_invoice_as_electronic(server_module):
+    """Same field, same null, as duplicate_invoice — and here the body
+    replaces what is stored."""
+    server = server_module
+    doc = _issued_doc([_rate(1220.0, "2026-02-09")])
+    doc["e_invoice"] = None
+    doc["ei_data"] = {"payment_method": "MP19"}
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document",
+                      return_value=_doc_response(doc)) as modify, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme"}):
+        _run(server.call_tool("update_document", {
+            "document_id": 42, "visible_subject": "Nuovo",
+        }))
+
+    data = _sent_data(modify, "modify_issued_document_request")
+    assert data["e_invoice"] is True
+    assert data["ei_data"]["payment_method"] == "MP19"
+
+
+def test_update_document_rebuild_keeps_a_float_payment_days(server_module):
+    """An integral float is the same term: falling back to 30 would move the
+    due date of a document nobody rescheduled."""
+    server = server_module
+    doc = _issued_doc([_rate(1220.0, "2026-02-24",
+                             payment_terms={"days": 45.0, "type": "standard"})])
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document",
+                      return_value=_doc_response(doc)) as modify, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme"}):
+        _run(server.call_tool("update_document", {
+            "document_id": 42,
+            "items": [{"name": "Item", "qty": 1, "net_price": 2000.0, "vat_rate": 22}],
+        }))
+
+    sent = _sent_payments(modify, "modify_issued_document_request")
+    assert sent[0]["payment_terms"]["days"] == 45
+    assert sent[0]["due_date"] == "2026-02-24"

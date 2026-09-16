@@ -2330,3 +2330,53 @@ def test_update_document_rebuild_keeps_a_float_payment_days(server_module):
     sent = _sent_payments(modify, "modify_issued_document_request")
     assert sent[0]["payment_terms"]["days"] == 45
     assert sent[0]["due_date"] == "2026-02-24"
+
+
+# --------------------------------------------------------------------------
+# review round 18
+# --------------------------------------------------------------------------
+
+def test_update_document_omits_ei_data_with_nothing_to_inherit(server_module):
+    """Reading the null as electronic opened a branch that writes MP05 on a
+    document that never declared a payment method — and here the body
+    replaces what is stored."""
+    server = server_module
+    doc = _issued_doc([_rate(1220.0, "2026-02-09")])
+    doc["e_invoice"] = None
+    doc["ei_data"] = None
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document",
+                      return_value=_doc_response(doc)) as modify, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme"}):
+        _run(server.call_tool("update_document", {
+            "document_id": 42, "visible_subject": "Nuovo",
+        }))
+
+    data = _sent_data(modify, "modify_issued_document_request")
+    assert data["e_invoice"] is True
+    assert "ei_data" not in data
+
+
+def test_convert_proforma_inherits_the_payment_method(server_module):
+    """The second link of the fallback chain exists for documents that are not
+    e-invoices: a proforma with SEPA configured has it."""
+    server = server_module
+    proforma = _issued_doc([_rate(1220.0, "2026-02-09")])
+    proforma["type"] = "proforma"
+    proforma["payment_method"] = {"id": 7, "name": "RID", "ei_payment_method": "MP19"}
+    created = MagicMock()
+    created.data.to_dict.return_value = {"id": 11, "number": 3, "date": "2026-02-01"}
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(proforma)), \
+         patch.object(server.issued_api, "create_issued_document",
+                      return_value=created) as create, \
+         patch.object(server.issued_api, "delete_issued_document"), \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme", "ei_code": "A1"}):
+        _run(server.call_tool("convert_proforma_to_invoice", {"document_id": 10}))
+
+    body = create.call_args.kwargs["create_issued_document_request"]["data"]
+    assert body["e_invoice"] is True  # the tool's contract is an e-invoice
+    assert body["ei_data"]["payment_method"] == "MP19"

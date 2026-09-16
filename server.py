@@ -295,6 +295,23 @@ def _payment_days_argument(value, default=30):
     return value, None
 
 
+def _ei_data_of(doc, default_payment_method=None):
+    """E-invoice attributes to echo back: the stored dict without the nulls
+    `to_dict()` emits, with the payment method taken from the document's own
+    method registry when the dict does not carry one. Returns {} when there is
+    nothing to inherit — omitting the field leaves the stored one alone, while
+    writing a default would declare a payment method the document never had."""
+    ei_data = {k: v for k, v in (doc.get("ei_data") or {}).items() if v is not None}
+    payment_method = (
+        ei_data.get("payment_method")
+        or (doc.get("payment_method") or {}).get("ei_payment_method")
+        or default_payment_method
+    )
+    if payment_method:
+        ei_data["payment_method"] = payment_method
+    return ei_data
+
+
 def _error(message, **extra):
     payload = {"success": False, "error": message}
     payload.update(extra)
@@ -1260,7 +1277,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             body_data = {
                 "type": "invoice",
                 "e_invoice": True,
-                "ei_data": {"payment_method": "MP05"},
+                "ei_data": _ei_data_of(orig, default_payment_method="MP05"),
                 "entity": entity,
                 "date": date_str,
                 "visible_subject": orig.get("visible_subject", ""),
@@ -1449,14 +1466,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 # edit would change what the XML declares.
                 body_data["e_invoice"] = True if orig.get("e_invoice") is None else bool(orig["e_invoice"])
                 if body_data["e_invoice"]:
-                    ei_data = {k: v for k, v in (orig.get("ei_data") or {}).items() if v is not None}
-                    payment_method = (
-                        ei_data.get("payment_method")
-                        or (orig.get("payment_method") or {}).get("ei_payment_method")
-                        or "MP05"
-                    )
-                    ei_data["payment_method"] = payment_method
-                    body_data["ei_data"] = ei_data
+                    ei_data = _ei_data_of(orig)
+                    if ei_data:
+                        body_data["ei_data"] = ei_data
 
             response = issued_api.modify_issued_document(
                 company_id=COMPANY_ID,
@@ -1544,13 +1556,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                                    "payment_terms": {"days": payment_days, "type": payment_terms_type}}]
             }
             if body_data["e_invoice"]:
-                ei_data = {k: v for k, v in (orig.get("ei_data") or {}).items() if v is not None}
-                ei_data["payment_method"] = (
-                    ei_data.get("payment_method")
-                    or (orig.get("payment_method") or {}).get("ei_payment_method")
-                    or "MP05"
-                )
-                body_data["ei_data"] = ei_data
+                ei_data = _ei_data_of(orig, default_payment_method="MP05")
+                if ei_data:
+                    body_data["ei_data"] = ei_data
             if revenue_center:
                 body_data["rc_center"] = revenue_center
             body = {"data": body_data}

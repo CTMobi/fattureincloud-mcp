@@ -2084,3 +2084,136 @@ def test_create_invoice_normalizes_an_unpadded_date(server_module):
         }))
 
     assert create.call_args.kwargs["create_issued_document_request"]["data"]["date"] == "2026-02-05"
+
+
+# --------------------------------------------------------------------------
+# review round 15
+# --------------------------------------------------------------------------
+
+def _duplicate_source(**extra):
+    doc = _issued_doc([_rate(1220.0, "2026-02-09")])
+    doc.update(extra)
+    return doc
+
+
+@pytest.mark.parametrize("new_date", [None, "16/09/2026", "2026-02-05junk"])
+def test_duplicate_invoice_validates_new_date(server_module, new_date):
+    """duplicate_invoice is the one write path that does not go through
+    build_issued_document, so the validation never reached it."""
+    server = server_module
+    doc = _duplicate_source()
+
+    created = MagicMock()
+    created.data.to_dict.return_value = {"id": 2, "number": 9, "date": "2026-03-01"}
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "create_issued_document",
+                      return_value=created) as create, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme", "ei_code": "A1"}):
+        result = _run(server.call_tool("duplicate_invoice", {
+            "source_document_id": 42, "new_date": new_date,
+        }))
+
+    payload = json.loads(result[0].text)
+    if new_date is None:
+        assert payload["success"] is True  # null means "today", as elsewhere
+    else:
+        assert not create.called
+        assert payload["success"] is False
+
+
+def test_update_document_rejects_a_non_integer_payment_days(server_module):
+    """Same argument name as create_invoice, which answers with a message."""
+    server = server_module
+    doc = _issued_doc([_rate(1220.0, "2026-02-09")])
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document") as modify, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme"}):
+        result = _run(server.call_tool("update_document", {
+            "document_id": 42, "payment_days": "30",
+        }))
+
+    assert not modify.called
+    assert "payment_days" in json.loads(result[0].text)["error"]
+
+
+def test_create_invoice_rejects_a_date_with_trailing_junk(server_module):
+    """The [:10] truncation was removed from paid_date for this reason."""
+    server = server_module
+
+    with patch.object(server.issued_api, "create_issued_document") as create, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme", "ei_code": "A1"}):
+        result = _run(server.call_tool("create_invoice", {
+            "client_id": 5, "date": "2026-02-05junk", "visible_subject": "Test",
+            "items": [{"name": "Item", "qty": 1, "net_price": 100.0}],
+        }))
+
+    assert not create.called
+    assert json.loads(result[0].text)["success"] is False
+
+
+@pytest.mark.parametrize("days", [10 ** 10, -5])
+def test_create_invoice_rejects_payment_days_out_of_range(server_module, days):
+    """timedelta raises above 999999999, and a negative one puts the due date
+    before the document."""
+    server = server_module
+
+    with patch.object(server.issued_api, "create_issued_document") as create, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme", "ei_code": "A1"}):
+        result = _run(server.call_tool("create_invoice", {
+            "client_id": 5, "date": "2026-01-10", "payment_days": days,
+            "visible_subject": "Test",
+            "items": [{"name": "Item", "qty": 1, "net_price": 100.0}],
+        }))
+
+    assert not create.called
+    assert "payment_days" in json.loads(result[0].text)["error"]
+
+
+def test_duplicate_invoice_keeps_the_whole_ei_data(server_module):
+    """A copy that drops the IBAN or the linked order is a different document."""
+    server = server_module
+    doc = _duplicate_source(e_invoice=True, ei_data={
+        "payment_method": "MP19", "bank_iban": "IT60X0542811101000000123456",
+        "original_document_type": "ordine",
+    })
+    created = MagicMock()
+    created.data.to_dict.return_value = {"id": 2, "number": 9, "date": "2026-03-01"}
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "create_issued_document",
+                      return_value=created) as create, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme", "ei_code": "A1"}):
+        _run(server.call_tool("duplicate_invoice", {
+            "source_document_id": 42, "new_date": "2026-03-01",
+        }))
+
+    ei_data = create.call_args.kwargs["create_issued_document_request"]["data"]["ei_data"]
+    assert ei_data["payment_method"] == "MP19"
+    assert ei_data["bank_iban"] == "IT60X0542811101000000123456"
+    assert ei_data["original_document_type"] == "ordine"
+
+
+def test_duplicate_invoice_treats_a_null_e_invoice_as_electronic(server_module):
+    """to_dict() emits unset keys: the `, True` default never fires on a null."""
+    server = server_module
+    doc = _duplicate_source(e_invoice=None, ei_data=None)
+    created = MagicMock()
+    created.data.to_dict.return_value = {"id": 2, "number": 9, "date": "2026-03-01"}
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "create_issued_document",
+                      return_value=created) as create, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme", "ei_code": "A1"}):
+        _run(server.call_tool("duplicate_invoice", {
+            "source_document_id": 42, "new_date": "2026-03-01",
+        }))
+
+    body = create.call_args.kwargs["create_issued_document_request"]["data"]
+    assert body["e_invoice"] is True
+    assert body["ei_data"]["payment_method"] == "MP05"

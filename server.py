@@ -538,7 +538,12 @@ def build_issued_document(doc_type, client_id, items_data, date_str, payment_day
         body_data["rc_center"] = revenue_center
     if doc_type in ("invoice", "credit_note"):
         body_data["e_invoice"] = True
-        body_data["ei_data"] = {"payment_method": "MP05"}
+        client_method = client_data.get("default_payment_method") or {}
+        body_data["ei_data"] = {
+            "payment_method": client_method.get("ei_payment_method") or "MP05"
+        }
+        if client_method.get("id"):
+            body_data["payment_method"] = {"id": client_method["id"]}
     # `original_document` is not a writable field: it is absent from the spec's
     # IssuedDocument schema and the SDK model drops it, so the link was never
     # made. FIC links documents through /issued_documents/transform.
@@ -1289,6 +1294,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     "payment_terms": {"days": payment_days, "type": payment_terms_type}
                 }]
             }
+            # an explicit null is not an omitted field: only send what exists
+            if (orig.get("payment_method") or {}).get("id"):
+                body_data["payment_method"] = {"id": orig["payment_method"]["id"]}
             if revenue_center:
                 body_data["rc_center"] = revenue_center
             body = {"data": body_data}
@@ -1556,9 +1564,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                                    "payment_terms": {"days": payment_days, "type": payment_terms_type}}]
             }
             if body_data["e_invoice"]:
-                ei_data = _ei_data_of(orig, default_payment_method="MP05")
-                if ei_data:
-                    body_data["ei_data"] = ei_data
+                body_data["ei_data"] = _ei_data_of(orig, default_payment_method="MP05")
+            if (orig.get("payment_method") or {}).get("id"):
+                body_data["payment_method"] = {"id": orig["payment_method"]["id"]}
             if revenue_center:
                 body_data["rc_center"] = revenue_center
             body = {"data": body_data}

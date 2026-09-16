@@ -2380,3 +2380,91 @@ def test_convert_proforma_inherits_the_payment_method(server_module):
     body = create.call_args.kwargs["create_issued_document_request"]["data"]
     assert body["e_invoice"] is True  # the tool's contract is an e-invoice
     assert body["ei_data"]["payment_method"] == "MP19"
+
+
+# --------------------------------------------------------------------------
+# review round 19
+# --------------------------------------------------------------------------
+
+CLIENT_WITH_METHOD = {
+    "name": "Acme", "ei_code": "A1",
+    "default_payment_method": {"id": 7, "name": "Bonifico", "ei_payment_method": "MP05"},
+}
+
+
+def test_create_invoice_uses_the_client_default_payment_method(server_module):
+    """Every invoice declared MP05 in the XML; the client registry carries the
+    method the FIC panel itself uses."""
+    server = server_module
+    client = dict(CLIENT_WITH_METHOD)
+    client["default_payment_method"] = {"id": 7, "name": "RID", "ei_payment_method": "MP19"}
+    created = MagicMock()
+    created.data.to_dict.return_value = {"id": 1, "number": 1, "date": "2026-01-10"}
+
+    with patch.object(server.issued_api, "create_issued_document", return_value=created) as create, \
+         patch.object(server, "get_client_by_id", return_value=client):
+        _run(server.call_tool("create_invoice", {
+            "client_id": 5, "date": "2026-01-10", "visible_subject": "Test",
+            "items": [{"name": "Item", "qty": 1, "net_price": 100.0}],
+        }))
+
+    body = create.call_args.kwargs["create_issued_document_request"]["data"]
+    assert body["ei_data"]["payment_method"] == "MP19"
+    assert body["payment_method"] == {"id": 7}
+
+
+def test_create_invoice_falls_back_to_mp05_without_a_client_method(server_module):
+    server = server_module
+    created = MagicMock()
+    created.data.to_dict.return_value = {"id": 1, "number": 1, "date": "2026-01-10"}
+
+    with patch.object(server.issued_api, "create_issued_document", return_value=created) as create, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme", "ei_code": "A1"}):
+        _run(server.call_tool("create_invoice", {
+            "client_id": 5, "date": "2026-01-10", "visible_subject": "Test",
+            "items": [{"name": "Item", "qty": 1, "net_price": 100.0}],
+        }))
+
+    body = create.call_args.kwargs["create_issued_document_request"]["data"]
+    assert body["ei_data"]["payment_method"] == "MP05"
+    assert "payment_method" not in body
+
+
+def test_duplicate_invoice_echoes_the_payment_method_field(server_module):
+    """Inheriting the method into the XML but not into the field leaves the
+    copy with an empty payment method in the FIC panel."""
+    server = server_module
+    doc = _duplicate_source(e_invoice=True, ei_data={"payment_method": "MP19"},
+                            payment_method={"id": 7, "name": "RID", "ei_payment_method": "MP19"})
+    created = MagicMock()
+    created.data.to_dict.return_value = {"id": 2, "number": 9, "date": "2026-03-01"}
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "create_issued_document",
+                      return_value=created) as create, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme", "ei_code": "A1"}):
+        _run(server.call_tool("duplicate_invoice", {
+            "source_document_id": 42, "new_date": "2026-03-01",
+        }))
+
+    assert create.call_args.kwargs["create_issued_document_request"]["data"]["payment_method"] == {"id": 7}
+
+
+def test_convert_proforma_echoes_the_payment_method_field(server_module):
+    server = server_module
+    proforma = _issued_doc([_rate(1220.0, "2026-02-09")])
+    proforma["type"] = "proforma"
+    proforma["payment_method"] = {"id": 7, "name": "RID", "ei_payment_method": "MP19"}
+    created = MagicMock()
+    created.data.to_dict.return_value = {"id": 11, "number": 3, "date": "2026-02-01"}
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(proforma)), \
+         patch.object(server.issued_api, "create_issued_document",
+                      return_value=created) as create, \
+         patch.object(server.issued_api, "delete_issued_document"), \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme", "ei_code": "A1"}):
+        _run(server.call_tool("convert_proforma_to_invoice", {"document_id": 10}))
+
+    assert create.call_args.kwargs["create_issued_document_request"]["data"]["payment_method"] == {"id": 7}

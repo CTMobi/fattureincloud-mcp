@@ -2217,3 +2217,72 @@ def test_duplicate_invoice_treats_a_null_e_invoice_as_electronic(server_module):
     body = create.call_args.kwargs["create_issued_document_request"]["data"]
     assert body["e_invoice"] is True
     assert body["ei_data"]["payment_method"] == "MP05"
+
+
+# --------------------------------------------------------------------------
+# review round 16
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("stored_days", [5000, 30.0, None])
+def test_update_document_absorbs_a_stored_payment_days(server_module, stored_days):
+    """The stored value is not an argument: refusing an unrelated edit and
+    naming payment_days points at something the caller never sent."""
+    server = server_module
+    doc = _issued_doc([_rate(1220.0, "2026-02-09",
+                             payment_terms={"days": stored_days, "type": "standard"})])
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document",
+                      return_value=_doc_response(doc)) as modify, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme"}):
+        result = _run(server.call_tool("update_document", {
+            "document_id": 42, "visible_subject": "Nuovo",
+        }))
+
+    assert modify.called
+    assert json.loads(result[0].text)["success"] is True
+
+
+def test_update_document_date_error_names_the_value_it_parsed(server_module):
+    """With no date argument the default is the stored one: blaming 'None'
+    points at an argument the caller never wrote."""
+    server = server_module
+    doc = _issued_doc([_rate(1220.0, "2026-02-09")])
+    doc["date"] = "10/02/2026"
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document") as modify, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme"}):
+        result = _run(server.call_tool("update_document", {
+            "document_id": 42, "visible_subject": "Nuovo",
+        }))
+
+    assert not modify.called
+    error = json.loads(result[0].text)["error"]
+    assert "10/02/2026" in error
+    assert "'None'" not in error
+
+
+def test_duplicate_invoice_drops_null_ei_data_fields(server_module):
+    """to_dict() emits unset keys as null: copying them writes explicit nulls
+    over every EI field the source did not have."""
+    server = server_module
+    doc = _duplicate_source(e_invoice=True, ei_data={
+        "payment_method": "MP19", "bank_iban": None, "cup": None,
+    })
+    created = MagicMock()
+    created.data.to_dict.return_value = {"id": 2, "number": 9, "date": "2026-03-01"}
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "create_issued_document",
+                      return_value=created) as create, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme", "ei_code": "A1"}):
+        _run(server.call_tool("duplicate_invoice", {
+            "source_document_id": 42, "new_date": "2026-03-01",
+        }))
+
+    ei_data = create.call_args.kwargs["create_issued_document_request"]["data"]["ei_data"]
+    assert ei_data == {"payment_method": "MP19"}

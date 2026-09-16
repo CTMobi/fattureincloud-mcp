@@ -231,7 +231,9 @@ def _payment_days_of(doc):
     `payment_terms: null` or `days: null`, and `days: 0` (rimessa diretta) is a
     real term that must survive."""
     days = _payment_terms_of(doc).get("days")
-    return 30 if days is None else days
+    if isinstance(days, bool) or not isinstance(days, int) or not 0 <= days <= 3650:
+        return 30
+    return days
 
 
 def _page_count(response):
@@ -273,15 +275,16 @@ def _iso_date(value, field="date", default=None):
     try:
         return datetime.strptime(str(raw).strip(), "%Y-%m-%d"), None
     except (TypeError, ValueError):
-        return None, f"{field} '{value}' non valida: usa il formato YYYY-MM-DD."
+        return None, f"{field} '{raw}' non valida: usa il formato YYYY-MM-DD."
 
 
 def _payment_days_argument(value, default=30):
-    """Validate a payment-terms argument. Returns (days, error): timedelta
-    raises above 999999999 days, and a negative one dates the installment
-    before the document."""
+    """Validate the payment-terms argument the caller sent. A null means the
+    default, which comes from the document and is returned untouched — only
+    what the caller wrote is judged, and only against 0-3650 days, since a
+    negative value dates the installment before the document."""
     if value is None:
-        value = default
+        return default, None
     if isinstance(value, bool) or not isinstance(value, int):
         return None, f"payment_days = {value!r}: serve un intero (giorni)."
     if not 0 <= value <= 3650:
@@ -673,7 +676,7 @@ async def list_tools():
                     "client_id": {"type": "integer", "description": "ID cliente"},
                     "items": {"type": "array", "minItems": 1, "items": item_schema},
                     "date": {"type": "string", "description": "Data YYYY-MM-DD (default: oggi)"},
-                    "payment_days": {"type": "integer", "description": "Giorni pagamento (default: 30)"},
+                    "payment_days": {"type": "integer", "minimum": 0, "maximum": 3650, "description": "Giorni pagamento (default: 30)"},
                     "visible_subject": {"type": "string", "description": "Oggetto visibile"},
                     "revenue_center": {"type": "string", "description": "Centro di ricavo (opzionale, deve esistere — vedi list_cost_centers)"}
                 },
@@ -690,7 +693,7 @@ async def list_tools():
                     "client_id": {"type": "integer", "description": "ID cliente"},
                     "items": {"type": "array", "minItems": 1, "items": item_schema},
                     "date": {"type": "string", "description": "Data YYYY-MM-DD (default: oggi)"},
-                    "payment_days": {"type": "integer", "description": "Giorni pagamento (default: 30)"},
+                    "payment_days": {"type": "integer", "minimum": 0, "maximum": 3650, "description": "Giorni pagamento (default: 30)"},
                     "visible_subject": {"type": "string", "description": "Oggetto visibile"},
                     "source_invoice_id": {"type": "integer", "description": "ID fattura originale da stornare (opzionale). Riportato nella risposta, ma l'API non permette di creare il collegamento formale: va fatto dal pannello FIC"},
                     "revenue_center": {"type": "string", "description": "Centro di ricavo (opzionale, deve esistere — vedi list_cost_centers)"}
@@ -708,7 +711,7 @@ async def list_tools():
                     "client_id": {"type": "integer", "description": "ID cliente"},
                     "items": {"type": "array", "minItems": 1, "items": item_schema},
                     "date": {"type": "string", "description": "Data YYYY-MM-DD (default: oggi)"},
-                    "payment_days": {"type": "integer", "description": "Giorni pagamento (default: 30)"},
+                    "payment_days": {"type": "integer", "minimum": 0, "maximum": 3650, "description": "Giorni pagamento (default: 30)"},
                     "visible_subject": {"type": "string", "description": "Oggetto visibile"},
                     "revenue_center": {"type": "string", "description": "Centro di ricavo (opzionale, deve esistere — vedi list_cost_centers)"}
                 },
@@ -740,7 +743,7 @@ async def list_tools():
                     "document_id": {"type": "integer", "description": "ID documento da modificare"},
                     "date": {"type": "string", "description": "Nuova data YYYY-MM-DD (opzionale)"},
                     "visible_subject": {"type": "string", "description": "Nuovo oggetto visibile (opzionale)"},
-                    "payment_days": {"type": "integer", "description": "Nuovi giorni pagamento (opzionale)"},
+                    "payment_days": {"type": "integer", "minimum": 0, "maximum": 3650, "description": "Nuovi giorni pagamento (opzionale)"},
                     "items": {
                         "type": "array",
                         "minItems": 1,
@@ -761,7 +764,7 @@ async def list_tools():
                 "properties": {
                     "source_document_id": {"type": "integer", "description": "ID fattura da duplicare"},
                     "new_date": {"type": "string", "description": "Nuova data YYYY-MM-DD (default: oggi)"},
-                    "payment_days": {"type": "integer", "description": "Giorni pagamento (default: eredita da originale)"},
+                    "payment_days": {"type": "integer", "minimum": 0, "maximum": 3650, "description": "Giorni pagamento (default: eredita da originale)"},
                     "description_replace": {
                         "type": "object",
                         "description": "Sostituzioni testo nella descrizione (es. 2025->2026)",
@@ -1443,7 +1446,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 # edit would change what the XML declares.
                 body_data["e_invoice"] = bool(orig.get("e_invoice"))
                 if body_data["e_invoice"]:
-                    ei_data = dict(orig.get("ei_data") or {})
+                    ei_data = {k: v for k, v in (orig.get("ei_data") or {}).items() if v is not None}
                     payment_method = (
                         ei_data.get("payment_method")
                         or (orig.get("payment_method") or {}).get("ei_payment_method")
@@ -1538,7 +1541,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                                    "payment_terms": {"days": payment_days, "type": payment_terms_type}}]
             }
             if body_data["e_invoice"]:
-                ei_data = dict(orig.get("ei_data") or {})
+                ei_data = {k: v for k, v in (orig.get("ei_data") or {}).items() if v is not None}
                 ei_data["payment_method"] = (
                     ei_data.get("payment_method")
                     or (orig.get("payment_method") or {}).get("ei_payment_method")

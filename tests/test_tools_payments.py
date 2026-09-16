@@ -193,7 +193,7 @@ def test_set_payment_issued_single_installment(server_module):
         "due_date": "2026-02-09",
         "status": "paid",
         "paid_date": "2026-02-05",
-        "payment_account": {"id": 110},
+        "payment_account": {"id": 110, "type": "standard"},
     }]
 
     payload = json.loads(result[0].text)
@@ -380,7 +380,7 @@ def test_set_payment_resolves_account_by_name(server_module):
         }))
 
     sent = _sent_payments(modify, "modify_issued_document_request")
-    assert sent[0]["payment_account"] == {"id": 110}
+    assert sent[0]["payment_account"] == {"id": 110, "type": "standard"}
 
 
 def test_set_payment_unknown_account_is_rejected(server_module):
@@ -421,7 +421,7 @@ def test_set_payment_received_single_installment(server_module):
     sent = _sent_payments(modify, "modify_received_document_request")
     assert sent[0]["status"] == "paid"
     assert sent[0]["paid_date"] == "2026-02-05"
-    assert sent[0]["payment_account"] == {"id": 111}
+    assert sent[0]["payment_account"] == {"id": 111, "type": "standard"}
     assert json.loads(result[0].text)["success"] is True
 
 
@@ -2468,3 +2468,231 @@ def test_convert_proforma_echoes_the_payment_method_field(server_module):
         _run(server.call_tool("convert_proforma_to_invoice", {"document_id": 10}))
 
     assert create.call_args.kwargs["create_issued_document_request"]["data"]["payment_method"] == {"id": 7}
+
+
+# --------------------------------------------------------------------------
+# independent review
+# --------------------------------------------------------------------------
+
+def _withholding_doc():
+    """A professional invoice: 1000 + 22% VAT, 20% ritenuta d'acconto, so FIC
+    stores an installment of 1020, not the 1220 the lines add up to."""
+    doc = _issued_doc([_rate(1020.0, "2026-02-09")])
+    doc["withholding_tax"] = 20.0
+    doc["withholding_tax_taxable"] = 100.0
+    return doc
+
+
+def test_update_document_keeps_the_stored_amount_when_items_are_untouched(server_module):
+    """total_abs models lines only: ritenuta, cassa, bollo and rivalsa live at
+    document level, so an items-derived total is not the document's total."""
+    server = server_module
+    doc = _withholding_doc()
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document",
+                      return_value=_doc_response(doc)) as modify, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme"}):
+        result = _run(server.call_tool("update_document", {
+            "document_id": 42, "visible_subject": "Nuovo",
+        }))
+
+    assert json.loads(result[0].text)["success"] is True
+    sent = _sent_payments(modify, "modify_issued_document_request")
+    assert sent[0]["amount"] == 1020.0
+
+
+def test_update_document_reschedule_keeps_the_stored_amount(server_module):
+    server = server_module
+    doc = _withholding_doc()
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document",
+                      return_value=_doc_response(doc)) as modify, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme"}):
+        _run(server.call_tool("update_document", {
+            "document_id": 42, "payment_days": 60,
+        }))
+
+    sent = _sent_payments(modify, "modify_issued_document_request")
+    assert sent[0]["amount"] == 1020.0
+
+
+def test_update_document_refuses_item_edits_on_a_document_with_withholding(server_module):
+    """Recomputing the lines cannot reproduce a total FIC derives from
+    document-level modifiers: refuse rather than write a wrong amount."""
+    server = server_module
+    doc = _withholding_doc()
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document") as modify, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme"}):
+        result = _run(server.call_tool("update_document", {
+            "document_id": 42,
+            "items": [{"name": "Item", "qty": 1, "net_price": 2000.0, "vat_rate": 22}],
+        }))
+
+    assert not modify.called
+    payload = json.loads(result[0].text)
+    assert payload["success"] is False
+    assert "ritenuta" in payload["error"] or "withholding_tax" in payload["error"]
+
+
+def test_set_payment_keeps_the_payment_account_type(server_module):
+    """PaymentAccount.type defaults to standard in the SDK model, so sending
+    only the id retypes a bank account."""
+    server = server_module
+    doc = _issued_doc([_rate(1220.0, "2026-02-09", "paid", paid_date="2026-02-05",
+                             payment_account={"id": 110, "name": "Banca", "type": "bank"})])
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document",
+                      return_value=_doc_response(doc)) as modify:
+        _run(server.call_tool("set_payment", {
+            "document_id": 42, "document_type": "issued", "status": "paid",
+            "paid_date": "2026-02-06",
+        }))
+
+    sent = _sent_payments(modify, "modify_issued_document_request")
+    assert sent[0]["payment_account"] == {"id": 110, "type": "bank"}
+
+
+def test_resolve_payment_account_reports_an_unreadable_registry(server_module):
+    """Its VAT twin distinguishes the outage; this one said the account does
+    not exist, and the obvious retry registers the incasso with no account."""
+    server = server_module
+    import cache as cache_mod
+    cache_mod.invalidate_all(100)
+
+    with patch.object(server.info_api, "list_payment_accounts", side_effect=RuntimeError("503")):
+        account, error = server.resolve_payment_account("Banca Intesa")
+
+    assert account is None
+    assert "anagrafica conti" in error
+    assert "non esiste" not in error
+
+
+def test_resolve_vat_type_reports_an_unreadable_registry(server_module):
+    server = server_module
+    import cache as cache_mod
+    cache_mod.invalidate_all(100)
+
+    with patch.object(server.info_api, "list_vat_types", side_effect=RuntimeError("503")):
+        vat_type, error = server.resolve_vat_type(22)
+
+    assert vat_type is None
+    assert "anagrafica IVA" in error
+
+
+def test_duplicate_invoice_copies_document_level_modifiers(server_module):
+    """The lines keep apply_withholding_taxes, so a copy without the document's
+    withholding percentage is due a different amount than the original."""
+    server = server_module
+    doc = _duplicate_source(withholding_tax=20.0, withholding_tax_taxable=100.0,
+                            stamp_duty=2.0, use_split_payment=True)
+    doc["items_list"][0]["apply_withholding_taxes"] = True
+    created = MagicMock()
+    created.data.to_dict.return_value = {"id": 2, "number": 9, "date": "2026-03-01"}
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "create_issued_document",
+                      return_value=created) as create, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme", "ei_code": "A1"}):
+        _run(server.call_tool("duplicate_invoice", {
+            "source_document_id": 42, "new_date": "2026-03-01",
+        }))
+
+    body = create.call_args.kwargs["create_issued_document_request"]["data"]
+    assert body["withholding_tax"] == 20.0
+    assert body["stamp_duty"] == 2.0
+    assert body["use_split_payment"] is True
+
+
+def test_get_situation_reads_enum_statuses_from_the_sdk(server_module):
+    """The handler, not just the helper: with plain strings the pre-fix
+    expression works, so nothing pinned the bug the CHANGELOG leads with."""
+    server = server_module
+    doc = _sdk_shaped(_issued_doc([_rate(1220.0, "2026-02-09", "paid", paid_date="2026-02-05")]))
+    listed = MagicMock()
+    listed.data = [MagicMock(**{"to_dict.return_value": doc})]
+    listed.last_page = 1
+    empty = MagicMock()
+    empty.data = []
+    empty.last_page = 1
+
+    with patch.object(server.issued_api, "list_issued_documents",
+                      side_effect=[listed, empty]), \
+         patch.object(server.received_api, "list_received_documents", return_value=empty):
+        result = _run(server.call_tool("get_situation", {"year": 2026}))
+
+    assert json.loads(result[0].text)["incassato"] == 1220.0
+
+
+def test_update_document_clamps_a_stored_out_of_range_payment_days(server_module):
+    """The clamp only bites on the rebuild branch: 5000 days would move the due
+    date years out."""
+    server = server_module
+    doc = _issued_doc([_rate(1220.0, "2026-02-09",
+                             payment_terms={"days": 5000, "type": "standard"})])
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document",
+                      return_value=_doc_response(doc)) as modify, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme"}):
+        _run(server.call_tool("update_document", {
+            "document_id": 42,
+            "items": [{"name": "Item", "qty": 1, "net_price": 2000.0, "vat_rate": 22}],
+        }))
+
+    sent = _sent_payments(modify, "modify_issued_document_request")
+    assert sent[0]["due_date"] == "2026-02-09"  # document date + 30, not + 5000
+
+
+def test_create_invoice_does_not_leak_internal_fields(server_module):
+    server = server_module
+    created = MagicMock()
+    created.data.to_dict.return_value = {"id": 1, "number": 1, "date": "2026-01-10"}
+
+    with patch.object(server.issued_api, "create_issued_document", return_value=created) as create, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme", "ei_code": "A1"}):
+        _run(server.call_tool("create_invoice", {
+            "client_id": 5, "date": "2026-01-10", "visible_subject": "Test",
+            "items": [{"name": "Item", "qty": 1, "net_price": 100.0}],
+        }))
+
+    item = create.call_args.kwargs["create_issued_document_request"]["data"]["items_list"][0]
+    assert not [k for k in item if k.startswith("_")]
+
+
+def test_update_document_refuses_a_document_sent_to_sdi(server_module):
+    """The contrast set_payment's own test names."""
+    server = server_module
+    doc = _issued_doc([_rate(1220.0, "2026-02-09")], ei_status="sent")
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document") as modify, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme"}):
+        result = _run(server.call_tool("update_document", {
+            "document_id": 42, "visible_subject": "Nuovo",
+        }))
+
+    assert not modify.called
+    assert json.loads(result[0].text)["success"] is False
+
+
+@pytest.mark.parametrize("page", [0, -1, "2"])
+def test_list_invoices_rejects_a_bad_page(server_module, page):
+    server = server_module
+
+    with patch.object(server.issued_api, "list_issued_documents") as listed:
+        result = _run(server.call_tool("list_invoices", {"year": 2026, "page": page}))
+
+    assert not listed.called
+    assert "page" in json.loads(result[0].text)["error"]

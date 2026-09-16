@@ -153,6 +153,9 @@ def resolve_payment_account(value):
     """Resolve a `payment_account` argument (numeric id or account name)
     against the cached account list. Returns (account, error_message)."""
     accounts = fetch_payment_accounts(company_id=COMPANY_ID)
+    if not accounts:
+        return None, ("Impossibile leggere l'anagrafica conti (/info/payment_accounts): "
+                      "riprova, senza non si può indicare il conto.")
     names = [a["name"] for a in accounts]
 
     if isinstance(value, int) and not isinstance(value, bool) or \
@@ -208,7 +211,12 @@ def _payment_entry(p):
     if hasattr(account, "to_dict"):
         account = account.to_dict()
     if isinstance(account, dict) and account.get("id"):
-        entry["payment_account"] = {"id": account["id"]}
+        # PaymentAccount.type defaults to `standard` in the SDK model, so
+        # sending the id alone retypes a bank account.
+        entry["payment_account"] = {
+            k: _enum_value(account[k]) if k == "type" else account[k]
+            for k in ("id", "type") if account.get(k)
+        }
     terms = p.get("payment_terms")
     if hasattr(terms, "to_dict"):
         terms = terms.to_dict()
@@ -281,6 +289,15 @@ def _iso_date(value, field="date", default=None):
         return None, f"{field} '{raw}' non valida: usa il formato YYYY-MM-DD."
 
 
+def _page_argument(value):
+    """Validate the `page` argument. Returns (page, error)."""
+    if value is None:
+        return 1, None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return None, f"page = {value!r}: serve un intero >= 1."
+    return value, None
+
+
 def _payment_days_argument(value, default=30):
     """Validate the payment-terms argument the caller sent. A null means the
     default, which comes from the document and is returned untouched — only
@@ -293,6 +310,21 @@ def _payment_days_argument(value, default=30):
     if not 0 <= value <= 3650:
         return None, f"payment_days = {value}: fuori intervallo (0-3650 giorni)."
     return value, None
+
+
+# Percentages and flags FIC applies on top of the lines (ritenuta d'acconto,
+# cassa previdenziale, rivalsa INPS, marca da bollo, split payment). The local
+# total only models the lines, so a document carrying any of these has a total
+# this server cannot reproduce.
+AMOUNT_MODIFIERS = (
+    "rivalsa", "cassa", "cassa_taxable", "cassa2", "cassa2_taxable",
+    "global_cassa_taxable", "withholding_tax", "withholding_tax_taxable",
+    "other_withholding_tax", "stamp_duty", "use_split_payment",
+)
+
+
+def _amount_modifiers_of(doc):
+    return {k: doc[k] for k in AMOUNT_MODIFIERS if doc.get(k) not in (None, 0, 0.0, False)}
 
 
 def _ei_data_of(doc, default_payment_method=None):
@@ -1000,7 +1032,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 last_day = 31 if month in [1,3,5,7,8,10,12] else 30 if month in [4,6,9,11] else 29
                 q = f"date >= '{year}-{month:02d}-01' and date <= '{year}-{month:02d}-{last_day}'"
 
-            page = arguments.get("page") or 1
+            page, page_error = _page_argument(arguments.get("page"))
+            if page_error:
+                return _error(page_error)
             response = issued_api.list_issued_documents(
                 company_id=COMPANY_ID, type=doc_type, q=q,
                 per_page=100, page=page, fieldset="detailed"
@@ -1407,9 +1441,20 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 date_str[:10] != str(orig.get("date", ""))[:10]
                 or payment_days != orig_days
             )
-            # Credit note installments can be stored negative while total_abs is
-            # always positive: only the magnitude tells whether the total moved.
-            total_moved = round(total_abs, 2) != abs(existing_total)
+            # The local total models the lines only, so it is comparable with
+            # what FIC stored only when the caller actually edited the lines.
+            # Credit note installments can be stored negative, hence the
+            # magnitude comparison.
+            items_edited = "items" in arguments
+            total_moved = items_edited and round(total_abs, 2) != abs(existing_total)
+            modifiers = _amount_modifiers_of(orig)
+            if items_edited and modifiers:
+                return _error(
+                    f"Il documento ha importi calcolati a livello documento ({modifiers}): "
+                    "ricalcolare le righe produrrebbe una rata diversa da quella che FIC "
+                    "calcola (ritenuta, cassa, rivalsa, bollo). Modifica le righe dal "
+                    "pannello FattureInCloud."
+                )
             registered = [p for p in existing_payments if p.get("status") != "not_paid"]
 
             if existing_payments and not (schedule_moved or total_moved):
@@ -1450,7 +1495,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 payments_list = [payment]
             else:
                 payments_list = [{
-                    "amount": round(total_abs, 2),
+                    # with the lines untouched the amount is the document's own
+                    "amount": round(total_abs, 2) if items_edited else existing_total,
                     "due_date": due_date.strftime("%Y-%m-%d"),
                     "status": "not_paid",
                     "payment_terms": {"days": payment_days, "type": payment_terms_type}
@@ -1567,6 +1613,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 body_data["ei_data"] = _ei_data_of(orig, default_payment_method="MP05")
             if (orig.get("payment_method") or {}).get("id"):
                 body_data["payment_method"] = {"id": orig["payment_method"]["id"]}
+            # the lines carry apply_withholding_taxes: without the document-level
+            # percentages the copy is due a different amount than the original
+            body_data.update(_amount_modifiers_of(orig))
             if revenue_center:
                 body_data["rc_center"] = revenue_center
             body = {"data": body_data}
@@ -1697,7 +1746,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             if month:
                 last_day = 31 if month in [1,3,5,7,8,10,12] else 30 if month in [4,6,9,11] else 29
                 q = f"date >= '{year}-{month:02d}-01' and date <= '{year}-{month:02d}-{last_day}'"
-            page = arguments.get("page") or 1
+            page, page_error = _page_argument(arguments.get("page"))
+            if page_error:
+                return _error(page_error)
             response = received_api.list_received_documents(
                 company_id=COMPANY_ID, type=doc_type, q=q,
                 per_page=100, page=page, fieldset="detailed"
@@ -1937,6 +1988,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                         entry["paid_date"] = paid_date
                     if account:
                         entry["payment_account"] = {"id": account["id"]}
+                        if account.get("type"):
+                            entry["payment_account"]["type"] = account["type"]
                 else:
                     entry.pop("paid_date", None)
                     entry.pop("payment_account", None)

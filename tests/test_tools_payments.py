@@ -1992,7 +1992,11 @@ def test_create_received_document_treats_a_null_vat_as_zero(server_module):
         }))
 
     assert json.loads(result[0].text)["success"] is True
-    assert create.call_args.kwargs["create_received_document_request"]["data"]["amount_gross"] == 100.0
+    body = create.call_args.kwargs["create_received_document_request"]["data"]
+    assert body["amount_vat"] == 0
+    # amount_gross is read-only: the SDK drops it from the request, so sending
+    # it would only look like it had an effect
+    assert "amount_gross" not in body
 
 
 # --------------------------------------------------------------------------
@@ -3119,9 +3123,12 @@ def test_get_situation_subtracts_supplier_credit_notes(server_module):
     with patch.object(server.issued_api, "list_issued_documents",
                       side_effect=[empty, empty]), \
          patch.object(server.received_api, "list_received_documents",
-                      side_effect=[costs, credits_page]):
+                      side_effect=[costs, credits_page]) as listed:
         result = _run(server.call_tool("get_situation", {"year": 2026}))
 
+    # side_effect answers whatever type is asked for: pin the one that makes
+    # this a credit note rather than a self_invoice
+    assert listed.call_args_list[1].kwargs["type"] == "passive_credit_note"
     assert json.loads(result[0].text)["costi_totali"] == 0.0
 
 
@@ -3140,7 +3147,11 @@ def test_duplicate_invoice_points_a_proforma_at_the_converter(server_module):
         }))
 
     assert not create.called
-    assert "convert_proforma_to_invoice" in json.loads(result[0].text)["error"]
+    error = json.loads(result[0].text)["error"]
+    assert "convert_proforma_to_invoice" in error
+    # that tool deletes the proforma unless told otherwise, and duplicate_invoice
+    # is by contract non-destructive: the caller asked for a copy
+    assert "keep_proforma" in error
 
 
 def test_set_payment_synthesizes_an_installment_net_of_withholding(server_module):
@@ -3160,3 +3171,79 @@ def test_set_payment_synthesizes_an_installment_net_of_withholding(server_module
 
     sent = _sent_payments(modify, "modify_received_document_request")
     assert sent[0]["amount"] == 510.0  # 500 + 110 VAT - 100 withholding
+
+
+# --------------------------------------------------------------------------
+# review round 26
+# --------------------------------------------------------------------------
+
+def test_get_situation_exposes_the_supplier_credit_note_total(server_module):
+    """costi_totali changes value twice in this release: without the addend
+    nobody can reconcile it against the FIC panel."""
+    server = server_module
+    expense = MagicMock()
+    expense.to_dict.return_value = _sdk_received(_received_doc([]))
+    credit = MagicMock()
+    credit.to_dict.return_value = _sdk_received(
+        dict(_received_doc([]), type="passive_credit_note")
+    )
+    empty = MagicMock()
+    empty.data = []
+    empty.last_page = 1
+    costs = MagicMock()
+    costs.data = [expense]
+    costs.last_page = 1
+    credits_page = MagicMock()
+    credits_page.data = [credit]
+    credits_page.last_page = 1
+
+    with patch.object(server.issued_api, "list_issued_documents",
+                      side_effect=[empty, empty]), \
+         patch.object(server.received_api, "list_received_documents",
+                      side_effect=[costs, credits_page]):
+        result = _run(server.call_tool("get_situation", {"year": 2026}))
+
+    payload = json.loads(result[0].text)
+    assert payload["note_fornitore"] == 610.0
+    assert payload["costi_totali"] == 0.0
+
+
+def test_set_payment_explains_the_synthesized_amount(server_module):
+    """get_received_document reports 610 and the installment says 500: the
+    difference has to be readable somewhere, and this is the only branch where
+    the amount is decided here rather than by FIC."""
+    server = server_module
+    doc = _sdk_received(dict(
+        _received_doc([]),
+        amount_withholding_tax=100.0,
+        amount_other_withholding_tax=10.0,
+    ))
+
+    with patch.object(server.received_api, "get_received_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.received_api, "modify_received_document",
+                      return_value=_doc_response(doc)) as modify:
+        result = _run(server.call_tool("set_payment", {
+            "document_id": 99, "document_type": "received", "status": "paid",
+            "paid_date": "2026-02-05",
+        }))
+
+    assert _sent_payments(modify, "modify_received_document_request")[0]["amount"] == 500.0
+    nota = json.loads(result[0].text)["nota_importo"]
+    assert "610" in nota and "110" in nota
+
+
+def test_set_payment_stays_quiet_when_nothing_was_withheld(server_module):
+    """No withholding, no divergence to explain."""
+    server = server_module
+    doc = _sdk_received(_received_doc([]))
+
+    with patch.object(server.received_api, "get_received_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.received_api, "modify_received_document",
+                      return_value=_doc_response(doc)):
+        result = _run(server.call_tool("set_payment", {
+            "document_id": 99, "document_type": "received", "status": "paid",
+        }))
+
+    assert "nota_importo" not in json.loads(result[0].text)

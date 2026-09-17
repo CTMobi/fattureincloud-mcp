@@ -865,7 +865,7 @@ async def list_tools():
         ),
         Tool(
             name="duplicate_invoice",
-            description="Duplica una fattura esistente con nuova data (crea bozza). IMPORTANTE: Chiedere sempre conferma all'utente prima di eseguire.",
+            description="Duplica una fattura esistente con nuova data (crea bozza). Solo fatture: per una proforma usa convert_proforma_to_invoice. IMPORTANTE: Chiedere sempre conferma all'utente prima di eseguire.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1642,7 +1642,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             # would turn a reversal into a debit document with the same lines
             source_type = _enum_value(orig.get("type")) or "invoice"
             if source_type != "invoice":
-                recovery = ("Usa convert_proforma_to_invoice." if source_type == "proforma"
+                # convert_proforma_to_invoice deletes the source unless
+                # keep_proforma is set, and whoever asked for a copy wants the
+                # original kept
+                recovery = ("Usa convert_proforma_to_invoice con keep_proforma=true "
+                            "(senza, la proforma di origine viene eliminata)."
+                            if source_type == "proforma"
                             else "Duplicalo dal pannello FattureInCloud.")
                 return _error(
                     f"Il documento {source_id} è di tipo '{source_type}': duplicate_invoice "
@@ -1914,7 +1919,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
             fatturato_netto = totale_fatturato - totale_ndc
 
-            totale_costi = 0
+            totale_costi = totale_note_fornitore = 0
             if not client_filter:
                 ricevute = _all_pages(
                     received_api.list_received_documents,
@@ -1929,10 +1934,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 # supplier credit note reduces them, as an issued one reduces
                 # revenue. self_invoice stays out: counting a reverse-charge
                 # self-invoice would double the cost.
-                totale_costi = (
-                    sum(_gross_of(d.to_dict()) for d in ricevute)
-                    - sum(abs(_gross_of(d.to_dict())) for d in note_fornitore)
-                )
+                totale_note_fornitore = sum(abs(_gross_of(d.to_dict())) for d in note_fornitore)
+                totale_costi = sum(_gross_of(d.to_dict()) for d in ricevute) - totale_note_fornitore
 
             fatture_non_pagate.sort(key=lambda x: x.get('due_date', ''))
             result = {
@@ -1944,6 +1947,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "incassato": round(totale_incassato, 2),
                 "da_incassare": round(fatturato_netto - totale_incassato, 2),
                 "costi_totali": round(totale_costi, 2) if not client_filter else "N/A (filtro cliente attivo)",
+                "note_fornitore": round(totale_note_fornitore, 2) if not client_filter else "N/A (filtro cliente attivo)",
                 "margine_lordo": round(fatturato_netto - totale_costi, 2) if not client_filter else "N/A",
                 "prossime_scadenze": fatture_non_pagate[:10]
             }
@@ -2034,12 +2038,20 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             d = response.data.to_dict()
 
             payments = [_payment_entry(p) for p in (d.get("payments_list") or [])]
+            nota_importo = None
             if not payments:
                 if doc_kind == "issued":
                     return _error(
                         f"Documento {doc_id} senza scadenze di pagamento: impossibile registrare l'incasso."
                     )
                 amount = _amount_due_of(d)
+                ritenuta = round(_gross_of(d) - amount, 2)
+                if ritenuta:
+                    nota_importo = (
+                        f"Il documento non aveva scadenze: rata creata per {round(amount, 2)}, "
+                        f"cioè il lordo {round(_gross_of(d), 2)} meno {ritenuta} di ritenuta, "
+                        f"che il committente versa all'Erario e non al fornitore."
+                    )
                 payments = [{
                     "amount": amount,
                     "due_date": str(d.get("date", ""))[:10],
@@ -2178,6 +2190,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "residuo": round(residuo, 2),
                 "message": f"{verb} {azione} su {len(targets)} rata/e del documento #{number}.",
             }
+            if nota_importo:
+                result["nota_importo"] = nota_importo
             if warning:
                 result["warning"] = warning
             return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
@@ -2262,7 +2276,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "date": date_str,
                 "amount_net": amount_net,
                 "amount_vat": amount_vat,
-                "amount_gross": amount_net + amount_vat,
+                # no amount_gross: it is read-only, so the SDK drops it from the
+                # request body and FIC computes it from the two amounts above
             }
             if arguments.get("category"):
                 body_data["category"] = arguments["category"]
@@ -2282,7 +2297,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "type": d.get("type"),
                 "supplier": d.get("entity", {}).get("name") if d.get("entity") else arguments["supplier_name"],
                 "date": str(d.get("date", "")),
-                "amount_gross": _gross_of(d) or (amount_net + amount_vat),
+                "amount_gross": _gross_of(d),
                 "message": f"Documento ricevuto creato (ID {d.get('id')}).",
             }
             if cost_center:

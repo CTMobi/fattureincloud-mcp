@@ -357,8 +357,12 @@ def _stored_totals(doc, fallback_total, fallback_due_date):
     """Totals to report after a write: FIC sizes the installment from the
     document, so the local estimate is only a fallback for a response that does
     not carry them."""
-    stored = ((doc.get("payments_list") or [{}])[0] or {})
-    total = doc.get("amount_gross")
+    payments = doc.get("payments_list") or []
+    stored = (payments[0] or {}) if payments else {}
+    # `amount_gross` is read-only and does not survive to_dict(): the
+    # installments are the only total the response carries, and they keep the
+    # document's own sign.
+    total = round(sum(p.get("amount") or 0 for p in payments), 2) if payments else None
     due_date = str(stored.get("due_date") or "")[:10]
     return (
         round(total if total is not None else fallback_total, 2),
@@ -613,6 +617,8 @@ def build_issued_document(doc_type, client_id, items_data, date_str, payment_day
     stored_total, stored_due_date = _stored_totals(
         d, result_total, due_date.strftime("%Y-%m-%d")
     )
+    if negate_prices:
+        stored_total = -abs(stored_total)
     result = {
         "success": True,
         "id": d.get("id"),
@@ -1501,7 +1507,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                         f"ha {len(registered)} rata/e con pagamento registrato: modificarne "
                         "importo o scadenze riscriverebbe un incasso già contabilizzato"
                     )
-                    if total_moved:
+                    modifiers = _amount_modifiers_of(orig, AMOUNT_MODIFIER_RATES)
+                    if modifiers:
+                        # the local total models the lines only, so it is not
+                        # comparable with what FIC derived from these
+                        reason += (f", e il totale non è riproducibile qui perché il documento "
+                                   f"ha importi calcolati a livello documento ({modifiers})")
+                    elif total_moved:
                         reason += (f" (totale ricalcolato {round(total_abs, 2)}, "
                                    f"somma rate {abs(existing_total)})")
                 else:
@@ -1572,15 +1584,20 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 modify_issued_document_request=request
             )
             d = response.data.to_dict()
+            stored_total, stored_due_date = _stored_totals(
+                d, result_total, due_date.strftime("%Y-%m-%d")
+            )
+            if is_credit_note:
+                stored_total = -abs(stored_total)
 
             result = {
                 "success": True,
                 "id": d.get("id"),
                 "number": d.get("number"),
                 "date": str(d.get("date", "")),
-                "due_date": due_date.strftime("%Y-%m-%d"),
+                "due_date": stored_due_date,
                 "client": (client_data or {}).get("name", entity.get("name", "")),
-                "total": round(result_total, 2),
+                "total": stored_total,
                 "type": doc_type,
                 "status": "bozza",
                 "message": f"Documento #{d.get('number')} aggiornato con successo."

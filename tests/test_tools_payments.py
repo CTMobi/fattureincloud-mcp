@@ -2911,11 +2911,12 @@ def test_create_invoice_reports_the_totals_fic_stored(server_module):
     the response carries the document as written."""
     server = server_module
     created = MagicMock()
-    created.data.to_dict.return_value = {
-        "id": 1, "number": 1, "date": "2026-01-10",
+    # through the SDK models: amount_gross is read-only and does not survive
+    created.data.to_dict.return_value = _sdk_shaped({
+        "id": 1, "number": 1, "type": "invoice", "date": "2026-01-10",
         "amount_gross": 1022.0,  # 1000 + VAT - ritenuta + bollo, as FIC computed it
         "payments_list": [{"amount": 1022.0, "due_date": "2026-03-01", "status": "not_paid"}],
-    }
+    })
 
     with patch.object(server.issued_api, "create_issued_document", return_value=created), \
          patch.object(server, "get_client_by_id", return_value=CLIENT_WITH_METHOD):
@@ -2943,3 +2944,51 @@ def test_create_invoice_asks_fic_to_fix_the_installment(server_module):
         }))
 
     assert create.call_args.kwargs["create_issued_document_request"]["options"] == {"fix_payments": True}
+
+
+def test_update_document_reports_the_totals_fic_stored(server_module):
+    """The fourth write path: with fix_payments the local total is an estimate
+    FIC has already replaced."""
+    server = server_module
+    doc = _withholding_doc()
+    stored = _sdk_shaped({
+        "id": 42, "number": 7, "type": "invoice", "date": "2026-01-10",
+        "payments_list": [{"amount": 2440.0, "due_date": "2026-03-01", "status": "not_paid"}],
+    })
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document",
+                      return_value=_doc_response(stored)), \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme"}):
+        result = _run(server.call_tool("update_document", {
+            "document_id": 42,
+            "items": [{"name": "Item", "qty": 1, "net_price": 2000.0, "vat_rate": 22}],
+        }))
+
+    payload = json.loads(result[0].text)
+    assert payload["total"] == 2440.0
+    assert payload["due_date"] == "2026-03-01"
+
+
+def test_update_document_refusal_does_not_blame_an_unchanged_total(server_module):
+    """On a document with ritenuta the two numbers differ by the withholding,
+    not because anyone changed the total."""
+    server = server_module
+    doc = _withholding_doc()
+    doc["payments_list"][0]["status"] = "paid"
+    doc["payments_list"][0]["paid_date"] = "2026-02-05"
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document") as modify, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme"}):
+        result = _run(server.call_tool("update_document", {
+            "document_id": 42,
+            "items": [{"name": "Item", "qty": 1, "net_price": 1000.0, "vat_rate": 22}],
+        }))
+
+    assert not modify.called
+    error = json.loads(result[0].text)["error"]
+    assert "totale ricalcolato" not in error
+    assert "ritenuta" in error or "withholding_tax" in error

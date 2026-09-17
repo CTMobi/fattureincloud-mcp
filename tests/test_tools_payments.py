@@ -2521,25 +2521,46 @@ def test_update_document_reschedule_keeps_the_stored_amount(server_module):
     assert sent[0]["amount"] == 1020.0
 
 
-def test_update_document_refuses_item_edits_on_a_document_with_withholding(server_module):
+def test_update_document_lets_fic_size_a_rebuilt_installment(server_module):
     """Recomputing the lines cannot reproduce a total FIC derives from
-    document-level modifiers: refuse rather than write a wrong amount."""
+    document-level modifiers — so FIC sizes the installment instead."""
     server = server_module
     doc = _withholding_doc()
 
     with patch.object(server.issued_api, "get_issued_document",
                       return_value=_doc_response(doc)), \
-         patch.object(server.issued_api, "modify_issued_document") as modify, \
+         patch.object(server.issued_api, "modify_issued_document",
+                      return_value=_doc_response(doc)) as modify, \
          patch.object(server, "get_client_by_id", return_value={"name": "Acme"}):
         result = _run(server.call_tool("update_document", {
             "document_id": 42,
             "items": [{"name": "Item", "qty": 1, "net_price": 2000.0, "vat_rate": 22}],
         }))
 
-    assert not modify.called
-    payload = json.loads(result[0].text)
-    assert payload["success"] is False
-    assert "ritenuta" in payload["error"] or "withholding_tax" in payload["error"]
+    assert json.loads(result[0].text)["success"] is True
+    request = modify.call_args.kwargs["modify_issued_document_request"]
+    assert request["options"] == {"fix_payments": True}
+
+
+def test_update_document_does_not_fix_payments_it_preserved(server_module):
+    """Preserved installments are the user's plan: FIC must not resize the
+    last one to match the total."""
+    server = server_module
+    doc = _issued_doc([
+        _rate(610.0, "2026-01-31", "paid", paid_date="2026-01-30"),
+        _rate(610.0, "2026-02-28"),
+    ])
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document",
+                      return_value=_doc_response(doc)) as modify, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme"}):
+        _run(server.call_tool("update_document", {
+            "document_id": 42, "visible_subject": "Nuovo",
+        }))
+
+    assert "options" not in modify.call_args.kwargs["modify_issued_document_request"]
 
 
 def test_set_payment_keeps_the_payment_account_type(server_module):
@@ -2864,3 +2885,61 @@ def test_update_document_allows_item_edits_with_only_a_taxable_base(server_modul
 
     assert modify.called
     assert json.loads(result[0].text)["success"] is True
+
+
+def test_update_document_on_a_modifier_document_without_installments(server_module):
+    """The rebuild is forced here, so the amount cannot come from the lines."""
+    server = server_module
+    doc = _issued_doc([])
+    doc["withholding_tax"] = 20.0
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document",
+                      return_value=_doc_response(doc)) as modify, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme"}):
+        result = _run(server.call_tool("update_document", {
+            "document_id": 42, "visible_subject": "Nuovo",
+        }))
+
+    assert json.loads(result[0].text)["success"] is True
+    assert modify.call_args.kwargs["modify_issued_document_request"]["options"] == {"fix_payments": True}
+
+
+def test_create_invoice_reports_the_totals_fic_stored(server_module):
+    """Once FIC sizes the installment, the locally computed total is a guess:
+    the response carries the document as written."""
+    server = server_module
+    created = MagicMock()
+    created.data.to_dict.return_value = {
+        "id": 1, "number": 1, "date": "2026-01-10",
+        "amount_gross": 1022.0,  # 1000 + VAT - ritenuta + bollo, as FIC computed it
+        "payments_list": [{"amount": 1022.0, "due_date": "2026-03-01", "status": "not_paid"}],
+    }
+
+    with patch.object(server.issued_api, "create_issued_document", return_value=created), \
+         patch.object(server, "get_client_by_id", return_value=CLIENT_WITH_METHOD):
+        result = _run(server.call_tool("create_invoice", {
+            "client_id": 5, "date": "2026-01-10", "payment_days": 30,
+            "visible_subject": "Test",
+            "items": [{"name": "Item", "qty": 1, "net_price": 1000.0}],
+        }))
+
+    payload = json.loads(result[0].text)
+    assert payload["total"] == 1022.0
+    assert payload["due_date"] == "2026-03-01"
+
+
+def test_create_invoice_asks_fic_to_fix_the_installment(server_module):
+    server = server_module
+    created = MagicMock()
+    created.data.to_dict.return_value = {"id": 1, "number": 1, "date": "2026-01-10"}
+
+    with patch.object(server.issued_api, "create_issued_document", return_value=created) as create, \
+         patch.object(server, "get_client_by_id", return_value=CLIENT_WITH_METHOD):
+        _run(server.call_tool("create_invoice", {
+            "client_id": 5, "date": "2026-01-10", "visible_subject": "Test",
+            "items": [{"name": "Item", "qty": 1, "net_price": 100.0}],
+        }))
+
+    assert create.call_args.kwargs["create_issued_document_request"]["options"] == {"fix_payments": True}

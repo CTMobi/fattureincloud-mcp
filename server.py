@@ -353,6 +353,19 @@ def _ei_data_of(doc, default_payment_method=None):
     return ei_data
 
 
+def _stored_totals(doc, fallback_total, fallback_due_date):
+    """Totals to report after a write: FIC sizes the installment from the
+    document, so the local estimate is only a fallback for a response that does
+    not carry them."""
+    stored = ((doc.get("payments_list") or [{}])[0] or {})
+    total = doc.get("amount_gross")
+    due_date = str(stored.get("due_date") or "")[:10]
+    return (
+        round(total if total is not None else fallback_total, 2),
+        due_date or fallback_due_date,
+    )
+
+
 def _error(message, **extra):
     payload = {"success": False, "error": message}
     payload.update(extra)
@@ -597,15 +610,18 @@ def build_issued_document(doc_type, client_id, items_data, date_str, payment_day
     )
     d = response.data.to_dict()
 
+    stored_total, stored_due_date = _stored_totals(
+        d, result_total, due_date.strftime("%Y-%m-%d")
+    )
     result = {
         "success": True,
         "id": d.get("id"),
         "number": d.get("number"),
         "date": str(d.get("date", "")),
-        "due_date": due_date.strftime("%Y-%m-%d"),
+        "due_date": stored_due_date,
         "client": client_data.get("name"),
         "ei_code": entity.get("ei_code", "N/A"),
-        "total": round(result_total, 2),
+        "total": stored_total,
         "type": doc_type,
         "status": "bozza",
     }
@@ -1357,15 +1373,18 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             if not keep_proforma:
                 issued_api.delete_issued_document(company_id=COMPANY_ID, document_id=doc_id)
 
+            stored_total, stored_due_date = _stored_totals(
+                d, total_gross, due_date.strftime("%Y-%m-%d")
+            )
             result = {
                 "success": True,
                 "invoice_id": d.get("id"),
                 "invoice_number": d.get("number"),
                 "date": date_str,
-                "due_date": due_date.strftime("%Y-%m-%d"),
+                "due_date": stored_due_date,
                 "client": (client_data or {}).get("name", entity.get("name", "")),
                 "ei_code": entity.get("ei_code", "N/A"),
-                "total": round(total_gross, 2),
+                "total": stored_total,
                 "proforma_deleted": not keep_proforma,
                 "message": f"Fattura #{d.get('number')} creata da proforma #{orig.get('number')}. {'Proforma eliminata.' if not keep_proforma else 'Proforma mantenuta.'} Usa send_to_sdi per inviarla."
             }
@@ -1465,15 +1484,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 # the lines were not touched, so the document's total is the one
                 # FIC stored, not the one the lines add up to
                 result_total = -abs(existing_total) if is_credit_note else existing_total
-            modifiers = _amount_modifiers_of(orig, AMOUNT_MODIFIER_RATES)
-            if items_edited and modifiers:
-                return _error(
-                    f"Il documento ha importi calcolati a livello documento ({modifiers}): "
-                    "ricalcolare le righe produrrebbe una rata diversa da quella che FIC "
-                    "calcola (ritenuta, cassa, rivalsa, bollo). Modifica le righe dal "
-                    "pannello FattureInCloud."
-                )
+
             registered = [p for p in existing_payments if p.get("status") != "not_paid"]
+
+            # A rebuilt installment is sized from the lines, which do not model
+            # ritenuta, cassa, rivalsa or bollo: ask FIC to size it from the
+            # document instead. Preserved installments are the user's own plan,
+            # so they are never handed to fix_payments.
+            rebuilt = False
 
             if existing_payments and not (schedule_moved or total_moved):
                 payments_list = existing_payments
@@ -1508,10 +1526,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             elif registered:
                 # single settled installment, same total: only the due date moves
                 payment = dict(existing_payments[0])
+                rebuilt = False
                 payment["due_date"] = due_date.strftime("%Y-%m-%d")
                 payment["payment_terms"] = {"days": payment_days, "type": payment_terms_type}
                 payments_list = [payment]
             else:
+                rebuilt = True
                 payments_list = [{
                     # with the lines untouched the amount is the document's own,
                     # unless it stores none: the sum of nothing is not a total
@@ -1544,10 +1564,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     if ei_data:
                         body_data["ei_data"] = ei_data
 
+            request = {"data": body_data}
+            if rebuilt:
+                request["options"] = {"fix_payments": True}
             response = issued_api.modify_issued_document(
-                company_id=COMPANY_ID,
-                document_id=doc_id,
-                modify_issued_document_request={"data": body_data}
+                company_id=COMPANY_ID, document_id=doc_id,
+                modify_issued_document_request=request
             )
             d = response.data.to_dict()
 
@@ -1643,13 +1665,16 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 company_id=COMPANY_ID, create_issued_document_request=body
             )
             d = response.data.to_dict()
+            stored_total, stored_due_date = _stored_totals(
+                d, total_gross, due_date.strftime("%Y-%m-%d")
+            )
             result = {
                 "success": True, "id": d.get("id"), "number": d.get("number"),
-                "date": str(d.get("date", "")), "due_date": due_date.strftime("%Y-%m-%d"),
+                "date": str(d.get("date", "")), "due_date": stored_due_date,
                 "client": (client_data or {}).get("name", entity.get("name", "")),
-                "ei_code": entity.get("ei_code", "N/A"), "total": round(total_gross, 2),
+                "ei_code": entity.get("ei_code", "N/A"), "total": stored_total,
                 "source_invoice": orig.get("number"), "status": "bozza",
-                "message": f"Fattura #{d.get('number')} creata come bozza (duplicata da #{orig.get('number')}). Scadenza: {due_date.strftime('%d/%m/%Y')}."
+                "message": f"Fattura #{d.get('number')} creata come bozza (duplicata da #{orig.get('number')}). Scadenza: {stored_due_date}."
             }
             if revenue_center:
                 result["revenue_center"] = revenue_center

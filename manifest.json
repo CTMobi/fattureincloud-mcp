@@ -80,7 +80,7 @@
     {"name": "create_proforma", "description": "Create a draft proforma (cannot be sent to SDI). Optional revenue_center."},
     {"name": "convert_proforma_to_invoice", "description": "Convert a proforma into a draft electronic invoice. By default the source proforma is deleted (set keep_proforma=true to retain it)."},
     {"name": "update_document", "description": "Partial update of a draft document (invoice / credit note / proforma). Only fields passed are changed. Fails if the document was already sent to SDI, or if the edit would rewrite the payment schedule: documents with several installments, or with a registered payment whose total would change."},
-    {"name": "duplicate_invoice", "description": "Duplicate an invoice with a new date, optional payment-days override, and optional description text replacements."},
+    {"name": "duplicate_invoice", "description": "Duplicate an invoice with a new date, optional payment-days override, and optional description text replacements. Invoices only."},
     {"name": "delete_invoice", "description": "Delete a draft document. Irreversible."},
     {"name": "send_to_sdi", "description": "Send an invoice or credit note to the Italian Sistema di Interscambio (SDI). Irreversible."},
     {"name": "get_invoice_status", "description": "Read the e-invoice / SDI status of a document."},

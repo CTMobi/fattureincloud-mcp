@@ -3247,3 +3247,79 @@ def test_set_payment_stays_quiet_when_nothing_was_withheld(server_module):
         }))
 
     assert "nota_importo" not in json.loads(result[0].text)
+
+
+# --------------------------------------------------------------------------
+# review round 27
+# --------------------------------------------------------------------------
+
+def test_no_description_sends_to_the_converter_without_keep_proforma(server_module):
+    """The description is read before the call; the refusal only after one.
+    Whoever points at that tool has to name the flag that keeps the source."""
+    server = server_module
+    tools = _run(server.list_tools())
+    # a bare mention is a cross-reference (list_cost_centers lists the tools it
+    # validates); "usa <tool>" is what sends the caller there
+    pointing = [t for t in tools if "usa convert_proforma_to_invoice" in (t.description or "")]
+
+    assert pointing, "no tool points at the converter: the guard has lost its subject"
+    for tool in pointing:
+        assert "keep_proforma" in tool.description, tool.name
+
+
+def test_get_received_document_reports_the_withholding_and_what_is_due(server_module):
+    """After set_payment the document stores a 500 installment against a 610
+    gross: the two numbers have to be reconcilable in every later read."""
+    server = server_module
+    doc = _sdk_received(dict(
+        _received_doc([_rate(500.0, "2026-02-09")]),
+        amount_withholding_tax=100.0,
+        amount_other_withholding_tax=10.0,
+    ))
+
+    with patch.object(server.received_api, "get_received_document",
+                      return_value=_doc_response(doc)):
+        result = _run(server.call_tool("get_received_document", {"document_id": 99}))
+
+    payload = json.loads(result[0].text)
+    assert payload["amount_gross"] == 610.0
+    assert payload["amount_withholding_tax"] == 100.0
+    assert payload["amount_other_withholding_tax"] == 10.0
+    assert payload["amount_due"] == 500.0
+    assert payload["payments"][0]["amount"] == 500.0
+
+
+def test_get_situation_reads_the_same_way_on_both_sides(server_module):
+    """Revenue exposes lordo - note = netto. Costs exposed only the difference
+    and the subtrahend, so applying the same rule subtracts them twice."""
+    server = server_module
+    expense = MagicMock()
+    expense.to_dict.return_value = _sdk_received(
+        dict(_received_doc([]), amount_net=1000.0, amount_vat=220.0)
+    )
+    credit = MagicMock()
+    credit.to_dict.return_value = _sdk_received(dict(
+        _received_doc([]), type="passive_credit_note",
+        amount_net=250.0, amount_vat=55.0,
+    ))
+    empty = MagicMock()
+    empty.data = []
+    empty.last_page = 1
+    costs = MagicMock()
+    costs.data = [expense]
+    costs.last_page = 1
+    credits_page = MagicMock()
+    credits_page.data = [credit]
+    credits_page.last_page = 1
+
+    with patch.object(server.issued_api, "list_issued_documents",
+                      side_effect=[empty, empty]), \
+         patch.object(server.received_api, "list_received_documents",
+                      side_effect=[costs, credits_page]):
+        result = _run(server.call_tool("get_situation", {"year": 2026}))
+
+    payload = json.loads(result[0].text)
+    # three distinct numbers: no formula passes by coincidence
+    assert payload["costi_lordi"] == 1220.0
+    assert payload["note_fornitore"] == 305.0
+    assert payload["costi_totali"] == 915.0

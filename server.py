@@ -865,7 +865,7 @@ async def list_tools():
         ),
         Tool(
             name="duplicate_invoice",
-            description="Duplica una fattura esistente con nuova data (crea bozza). Solo fatture: per una proforma usa convert_proforma_to_invoice. IMPORTANTE: Chiedere sempre conferma all'utente prima di eseguire.",
+            description="Duplica una fattura esistente con nuova data (crea bozza). Solo fatture: per copiare una proforma usa convert_proforma_to_invoice con keep_proforma=true, altrimenti la proforma di origine viene eliminata. IMPORTANTE: Chiedere sempre conferma all'utente prima di eseguire.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1946,6 +1946,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "fatturato_netto": round(fatturato_netto, 2),
                 "incassato": round(totale_incassato, 2),
                 "da_incassare": round(fatturato_netto - totale_incassato, 2),
+                # same three terms as the revenue side, so lordo - note = totale
+                # reads by one rule on both halves
+                "costi_lordi": round(totale_costi + totale_note_fornitore, 2) if not client_filter else "N/A (filtro cliente attivo)",
                 "costi_totali": round(totale_costi, 2) if not client_filter else "N/A (filtro cliente attivo)",
                 "note_fornitore": round(totale_note_fornitore, 2) if not client_filter else "N/A (filtro cliente attivo)",
                 "margine_lordo": round(fatturato_netto - totale_costi, 2) if not client_filter else "N/A",
@@ -2231,6 +2234,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "amount_net": d.get("amount_net"),
                 "amount_vat": d.get("amount_vat"),
                 "amount_gross": _gross_of(d),
+                # what the supplier is actually paid: set_payment registers this
+                # amount, so the gross alone reads as an unexplained difference
+                "amount_withholding_tax": d.get("amount_withholding_tax"),
+                "amount_other_withholding_tax": d.get("amount_other_withholding_tax"),
+                "amount_due": round(_amount_due_of(d), 2),
                 "items": items,
                 "payments": payments,
             }

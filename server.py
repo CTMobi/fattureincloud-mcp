@@ -362,6 +362,14 @@ def _gross_of(doc):
     return (doc.get("amount_net") or 0) + (doc.get("amount_vat") or 0)
 
 
+def _amount_due_of(doc):
+    """What the supplier is actually paid: the gross less the withholding the
+    buyer keeps back (ritenuta d'acconto)."""
+    return (_gross_of(doc)
+            - (doc.get("amount_withholding_tax") or 0)
+            - (doc.get("amount_other_withholding_tax") or 0))
+
+
 def _stored_totals(doc, fallback_total, fallback_due_date):
     """Totals to report after a write: FIC sizes the installment from the
     document, so the local estimate is only a fallback for a response that does
@@ -1634,9 +1642,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             # would turn a reversal into a debit document with the same lines
             source_type = _enum_value(orig.get("type")) or "invoice"
             if source_type != "invoice":
+                recovery = ("Usa convert_proforma_to_invoice." if source_type == "proforma"
+                            else "Duplicalo dal pannello FattureInCloud.")
                 return _error(
                     f"Il documento {source_id} è di tipo '{source_type}': duplicate_invoice "
-                    "crea solo fatture. Duplicalo dal pannello FattureInCloud."
+                    f"crea solo fatture. {recovery}"
                 )
 
             client_id = orig.get("entity", {}).get("id")
@@ -1910,9 +1920,19 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     received_api.list_received_documents,
                     company_id=COMPANY_ID, type="expense", q=q, fieldset="detailed"
                 )
-                # revenue is gross (it comes from the installments), so costs
-                # have to be gross too or the margin absorbs the purchase VAT
-                totale_costi = sum(_gross_of(d.to_dict()) for d in ricevute)
+                note_fornitore = _all_pages(
+                    received_api.list_received_documents,
+                    company_id=COMPANY_ID, type="passive_credit_note", q=q, fieldset="detailed"
+                )
+                # revenue is gross (it comes from the installments), so costs have
+                # to be gross too or the margin absorbs the purchase VAT; and a
+                # supplier credit note reduces them, as an issued one reduces
+                # revenue. self_invoice stays out: counting a reverse-charge
+                # self-invoice would double the cost.
+                totale_costi = (
+                    sum(_gross_of(d.to_dict()) for d in ricevute)
+                    - sum(abs(_gross_of(d.to_dict())) for d in note_fornitore)
+                )
 
             fatture_non_pagate.sort(key=lambda x: x.get('due_date', ''))
             result = {
@@ -2019,9 +2039,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     return _error(
                         f"Documento {doc_id} senza scadenze di pagamento: impossibile registrare l'incasso."
                     )
-                amount = d.get("amount_gross")
-                if amount is None:
-                    amount = (d.get("amount_net") or 0) + (d.get("amount_vat") or 0)
+                amount = _amount_due_of(d)
                 payments = [{
                     "amount": amount,
                     "due_date": str(d.get("date", ""))[:10],
@@ -2264,7 +2282,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "type": d.get("type"),
                 "supplier": d.get("entity", {}).get("name") if d.get("entity") else arguments["supplier_name"],
                 "date": str(d.get("date", "")),
-                "amount_gross": d.get("amount_gross") or (amount_net + amount_vat),
+                "amount_gross": _gross_of(d) or (amount_net + amount_vat),
                 "message": f"Documento ricevuto creato (ID {d.get('id')}).",
             }
             if cost_center:

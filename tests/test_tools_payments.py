@@ -3017,7 +3017,8 @@ def test_get_situation_counts_costs_gross(server_module):
 
     with patch.object(server.issued_api, "list_issued_documents",
                       side_effect=[empty, empty]), \
-         patch.object(server.received_api, "list_received_documents", return_value=costs):
+         patch.object(server.received_api, "list_received_documents",
+                      side_effect=[costs, empty]):
         result = _run(server.call_tool("get_situation", {"year": 2026}))
 
     assert json.loads(result[0].text)["costi_totali"] == 610.0
@@ -3089,3 +3090,73 @@ def test_duplicate_invoice_refuses_a_credit_note(server_module):
 
     assert not create.called
     assert json.loads(result[0].text)["success"] is False
+
+
+# --------------------------------------------------------------------------
+# review round 25
+# --------------------------------------------------------------------------
+
+def test_get_situation_subtracts_supplier_credit_notes(server_module):
+    """Revenue subtracts issued credit notes; costs have to subtract the
+    supplier ones or a 610 EUR reversal stays in the margin forever."""
+    server = server_module
+    expense = MagicMock()
+    expense.to_dict.return_value = _sdk_received(_received_doc([]))
+    credit = MagicMock()
+    credit.to_dict.return_value = _sdk_received(
+        dict(_received_doc([]), type="passive_credit_note")
+    )
+    empty = MagicMock()
+    empty.data = []
+    empty.last_page = 1
+    costs = MagicMock()
+    costs.data = [expense]
+    costs.last_page = 1
+    credits_page = MagicMock()
+    credits_page.data = [credit]
+    credits_page.last_page = 1
+
+    with patch.object(server.issued_api, "list_issued_documents",
+                      side_effect=[empty, empty]), \
+         patch.object(server.received_api, "list_received_documents",
+                      side_effect=[costs, credits_page]):
+        result = _run(server.call_tool("get_situation", {"year": 2026}))
+
+    assert json.loads(result[0].text)["costi_totali"] == 0.0
+
+
+def test_duplicate_invoice_points_a_proforma_at_the_converter(server_module):
+    """The refusal must not send to the panel what this server can do."""
+    server = server_module
+    doc = _duplicate_source()
+    doc["type"] = "proforma"
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "create_issued_document") as create, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme", "ei_code": "A1"}):
+        result = _run(server.call_tool("duplicate_invoice", {
+            "source_document_id": 42, "new_date": "2026-03-01",
+        }))
+
+    assert not create.called
+    assert "convert_proforma_to_invoice" in json.loads(result[0].text)["error"]
+
+
+def test_set_payment_synthesizes_an_installment_net_of_withholding(server_module):
+    """A supplier with ritenuta is paid gross minus the withholding, which is
+    the amount the payment registers."""
+    server = server_module
+    doc = _sdk_received(dict(_received_doc([]), amount_withholding_tax=100.0))
+
+    with patch.object(server.received_api, "get_received_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.received_api, "modify_received_document",
+                      return_value=_doc_response(doc)) as modify:
+        _run(server.call_tool("set_payment", {
+            "document_id": 99, "document_type": "received", "status": "paid",
+            "paid_date": "2026-02-05",
+        }))
+
+    sent = _sent_payments(modify, "modify_received_document_request")
+    assert sent[0]["amount"] == 510.0  # 500 + 110 VAT - 100 withholding

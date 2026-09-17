@@ -2992,3 +2992,100 @@ def test_update_document_refusal_does_not_blame_an_unchanged_total(server_module
     error = json.loads(result[0].text)["error"]
     assert "totale ricalcolato" not in error
     assert "ritenuta" in error or "withholding_tax" in error
+
+
+# --------------------------------------------------------------------------
+# review round 24
+# --------------------------------------------------------------------------
+
+def _sdk_received(payload):
+    from fattureincloud_python_sdk.models.received_document import ReceivedDocument
+    return ReceivedDocument.from_dict(payload).to_dict()
+
+
+def test_get_situation_counts_costs_gross(server_module):
+    """Revenue comes from the installments (VAT included) while costs fell back
+    to amount_net, so the margin was overstated by the VAT on every purchase."""
+    server = server_module
+    expense = _sdk_received(_received_doc([]))  # 500 + 110 VAT
+    empty = MagicMock()
+    empty.data = []
+    empty.last_page = 1
+    costs = MagicMock()
+    costs.data = [MagicMock(**{"to_dict.return_value": expense})]
+    costs.last_page = 1
+
+    with patch.object(server.issued_api, "list_issued_documents",
+                      side_effect=[empty, empty]), \
+         patch.object(server.received_api, "list_received_documents", return_value=costs):
+        result = _run(server.call_tool("get_situation", {"year": 2026}))
+
+    assert json.loads(result[0].text)["costi_totali"] == 610.0
+
+
+def test_list_received_documents_reports_a_gross_total(server_module):
+    """Its issued twin reports the installments, i.e. gross."""
+    server = server_module
+    doc = MagicMock()
+    doc.to_dict.return_value = _sdk_received(_received_doc([]))
+    listed = MagicMock()
+    listed.data = [doc]
+    listed.last_page = 1
+
+    with patch.object(server.received_api, "list_received_documents", return_value=listed):
+        result = _run(server.call_tool("list_received_documents", {"year": 2026}))
+
+    assert json.loads(result[0].text)["documents"][0]["total"] == 610.0
+
+
+def test_get_received_document_reports_a_gross_amount(server_module):
+    server = server_module
+    doc = _sdk_received(_received_doc([_rate(610.0, "2026-02-09")]))
+
+    with patch.object(server.received_api, "get_received_document",
+                      return_value=_doc_response(doc)):
+        result = _run(server.call_tool("get_received_document", {"document_id": 99}))
+
+    assert json.loads(result[0].text)["amount_gross"] == 610.0
+
+
+def test_update_document_plan_refusal_does_not_mention_modifiers(server_module):
+    """Only the schedule moved: no total was compared, so nothing about the
+    total is what refused the edit."""
+    server = server_module
+    doc = _issued_doc([
+        _rate(610.0, "2026-01-31", "paid", paid_date="2026-01-30"),
+        _rate(610.0, "2026-02-28"),
+    ])
+    doc["withholding_tax"] = 20.0
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document") as modify, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme"}):
+        result = _run(server.call_tool("update_document", {
+            "document_id": 42, "payment_days": 60,
+        }))
+
+    assert not modify.called
+    error = json.loads(result[0].text)["error"]
+    assert "non è riproducibile" not in error
+    assert "totale ricalcolato" not in error
+
+
+def test_duplicate_invoice_refuses_a_credit_note(server_module):
+    """Duplicating a credit note as an invoice turns a reversal into a debit."""
+    server = server_module
+    doc = _duplicate_source()
+    doc["type"] = "credit_note"
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "create_issued_document") as create, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme", "ei_code": "A1"}):
+        result = _run(server.call_tool("duplicate_invoice", {
+            "source_document_id": 42, "new_date": "2026-03-01",
+        }))
+
+    assert not create.called
+    assert json.loads(result[0].text)["success"] is False

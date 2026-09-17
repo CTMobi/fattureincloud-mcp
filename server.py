@@ -353,6 +353,15 @@ def _ei_data_of(doc, default_payment_method=None):
     return ei_data
 
 
+def _gross_of(doc):
+    """Gross amount of a received document. `amount_gross` is read-only, so the
+    SDK model drops it from to_dict() and it has to be recomposed."""
+    gross = doc.get("amount_gross")
+    if gross is not None:
+        return gross
+    return (doc.get("amount_net") or 0) + (doc.get("amount_vat") or 0)
+
+
 def _stored_totals(doc, fallback_total, fallback_due_date):
     """Totals to report after a write: FIC sizes the installment from the
     document, so the local estimate is only a fallback for a response that does
@@ -360,8 +369,8 @@ def _stored_totals(doc, fallback_total, fallback_due_date):
     payments = doc.get("payments_list") or []
     stored = (payments[0] or {}) if payments else {}
     # `amount_gross` is read-only and does not survive to_dict(): the
-    # installments are the only total the response carries, and they keep the
-    # document's own sign.
+    # installments are the only total the response carries. Which sign FIC
+    # keeps them with is undocumented, so credit-note callers re-apply theirs.
     total = round(sum(p.get("amount") or 0 for p in payments), 2) if payments else None
     due_date = str(stored.get("due_date") or "")[:10]
     return (
@@ -1507,15 +1516,17 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                         f"ha {len(registered)} rata/e con pagamento registrato: modificarne "
                         "importo o scadenze riscriverebbe un incasso già contabilizzato"
                     )
-                    modifiers = _amount_modifiers_of(orig, AMOUNT_MODIFIER_RATES)
-                    if modifiers:
-                        # the local total models the lines only, so it is not
-                        # comparable with what FIC derived from these
-                        reason += (f", e il totale non è riproducibile qui perché il documento "
-                                   f"ha importi calcolati a livello documento ({modifiers})")
-                    elif total_moved:
-                        reason += (f" (totale ricalcolato {round(total_abs, 2)}, "
-                                   f"somma rate {abs(existing_total)})")
+                    if total_moved:
+                        modifiers = _amount_modifiers_of(orig, AMOUNT_MODIFIER_RATES)
+                        if modifiers:
+                            # the local total models the lines only, so it is not
+                            # comparable with what FIC derived from these
+                            reason += (", e il totale non è riproducibile qui perché il documento "
+                                       f"ha importi calcolati a livello documento "
+                                       f"({', '.join(sorted(modifiers))})")
+                        else:
+                            reason += (f" (totale ricalcolato {round(total_abs, 2)}, "
+                                       f"somma rate {abs(existing_total)})")
                 else:
                     reason = (f"ha un piano di {len(existing_payments)} rate: ricostruirlo lo "
                               "ridurrebbe a un'unica scadenza, perdendo la rateizzazione")
@@ -1618,6 +1629,15 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 company_id=COMPANY_ID, document_id=source_id, fieldset="detailed"
             )
             orig = response.data.to_dict()
+
+            # the body below is built as an invoice: duplicating a credit note
+            # would turn a reversal into a debit document with the same lines
+            source_type = _enum_value(orig.get("type")) or "invoice"
+            if source_type != "invoice":
+                return _error(
+                    f"Il documento {source_id} è di tipo '{source_type}': duplicate_invoice "
+                    "crea solo fatture. Duplicalo dal pannello FattureInCloud."
+                )
 
             client_id = orig.get("entity", {}).get("id")
             client_data = get_client_by_id(client_id) if client_id else None
@@ -1825,7 +1845,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 entry = {
                     "id": d.get("id"), "number": d.get("number"),
                     "date": str(d.get("date", "")), "supplier": supplier_name,
-                    "description": desc[:80], "total": d.get('amount_gross') or d.get('amount_net') or 0
+                    "description": desc[:80], "total": _gross_of(d)
                 }
                 if d.get("rc_center"):
                     entry["cost_center"] = d["rc_center"]
@@ -1890,10 +1910,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     received_api.list_received_documents,
                     company_id=COMPANY_ID, type="expense", q=q, fieldset="detailed"
                 )
-                totale_costi = sum(
-                    d.to_dict().get('amount_gross') or d.to_dict().get('amount_net') or 0
-                    for d in ricevute
-                )
+                # revenue is gross (it comes from the installments), so costs
+                # have to be gross too or the margin absorbs the purchase VAT
+                totale_costi = sum(_gross_of(d.to_dict()) for d in ricevute)
 
             fatture_non_pagate.sort(key=lambda x: x.get('due_date', ''))
             result = {
@@ -2179,7 +2198,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "category": d.get("category"),
                 "amount_net": d.get("amount_net"),
                 "amount_vat": d.get("amount_vat"),
-                "amount_gross": d.get("amount_gross"),
+                "amount_gross": _gross_of(d),
                 "items": items,
                 "payments": payments,
             }

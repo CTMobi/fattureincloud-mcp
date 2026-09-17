@@ -2388,7 +2388,9 @@ def test_convert_proforma_inherits_the_payment_method(server_module):
 
 CLIENT_WITH_METHOD = {
     "name": "Acme", "ei_code": "A1",
-    "default_payment_method": {"id": 7, "name": "Bonifico", "ei_payment_method": "MP05"},
+    # not MP05: that is the fallback, the one value where "read from the
+    # registry" and "fell back to the constant" agree
+    "default_payment_method": {"id": 7, "name": "RID", "ei_payment_method": "MP19"},
 }
 
 
@@ -2396,8 +2398,7 @@ def test_create_invoice_uses_the_client_default_payment_method(server_module):
     """Every invoice declared MP05 in the XML; the client registry carries the
     method the FIC panel itself uses."""
     server = server_module
-    client = dict(CLIENT_WITH_METHOD)
-    client["default_payment_method"] = {"id": 7, "name": "RID", "ei_payment_method": "MP19"}
+    client = CLIENT_WITH_METHOD
     created = MagicMock()
     created.data.to_dict.return_value = {"id": 1, "number": 1, "date": "2026-01-10"}
 
@@ -2696,3 +2697,170 @@ def test_list_invoices_rejects_a_bad_page(server_module, page):
 
     assert not listed.called
     assert "page" in json.loads(result[0].text)["error"]
+
+
+# --------------------------------------------------------------------------
+# independent review, round 2
+# --------------------------------------------------------------------------
+
+def test_create_proforma_sets_the_client_payment_method(server_module):
+    """payment_method is not an e-invoice field: without it on the proforma,
+    the conversion has nothing to inherit and falls back to MP05."""
+    server = server_module
+    created = MagicMock()
+    created.data.to_dict.return_value = {"id": 1, "number": 1, "date": "2026-01-10"}
+
+    with patch.object(server.issued_api, "create_issued_document", return_value=created) as create, \
+         patch.object(server, "get_client_by_id", return_value=CLIENT_WITH_METHOD):
+        _run(server.call_tool("create_proforma", {
+            "client_id": 5, "date": "2026-01-10", "visible_subject": "Test",
+            "items": [{"name": "Item", "qty": 1, "net_price": 100.0}],
+        }))
+
+    body = create.call_args.kwargs["create_issued_document_request"]["data"]
+    assert body["payment_method"] == {"id": 7}
+    assert "ei_data" not in body
+
+
+def test_create_invoice_declares_mp05_without_an_ei_mapping(server_module):
+    """A configured method with no electronic mapping: the id is set, and MP05
+    stays the only sensible thing to declare in the XML."""
+    server = server_module
+    client = {"name": "Acme", "ei_code": "A1",
+              "default_payment_method": {"id": 7, "name": "Contanti"}}
+    created = MagicMock()
+    created.data.to_dict.return_value = {"id": 1, "number": 1, "date": "2026-01-10"}
+
+    with patch.object(server.issued_api, "create_issued_document", return_value=created) as create, \
+         patch.object(server, "get_client_by_id", return_value=client):
+        _run(server.call_tool("create_invoice", {
+            "client_id": 5, "date": "2026-01-10", "visible_subject": "Test",
+            "items": [{"name": "Item", "qty": 1, "net_price": 100.0}],
+        }))
+
+    body = create.call_args.kwargs["create_issued_document_request"]["data"]
+    assert body["payment_method"] == {"id": 7}
+    assert body["ei_data"]["payment_method"] == "MP05"
+
+
+def test_payment_method_survives_the_sdk_request_model(server_module):
+    """original_document was dropped by the model for a whole release: assert
+    the key reaches the wire instead of only the mock."""
+    from fattureincloud_python_sdk.models.create_issued_document_request import (
+        CreateIssuedDocumentRequest,
+    )
+    server = server_module
+    created = MagicMock()
+    created.data.to_dict.return_value = {"id": 1, "number": 1, "date": "2026-01-10"}
+
+    with patch.object(server.issued_api, "create_issued_document", return_value=created) as create, \
+         patch.object(server, "get_client_by_id", return_value=CLIENT_WITH_METHOD):
+        _run(server.call_tool("create_invoice", {
+            "client_id": 5, "date": "2026-01-10", "visible_subject": "Test",
+            "items": [{"name": "Item", "qty": 1, "net_price": 100.0}],
+        }))
+
+    request = create.call_args.kwargs["create_issued_document_request"]
+    serialized = CreateIssuedDocumentRequest.from_dict(request).to_dict()
+    assert serialized["data"]["payment_method"]["id"] == 7
+    assert serialized["data"]["ei_data"]["payment_method"] == "MP19"
+
+
+def test_creation_paths_ask_fic_to_fix_the_installment(server_module):
+    """The local total models the lines only: FIC recomputes the installment
+    from the document it actually built."""
+    server = server_module
+    doc = _duplicate_source(withholding_tax=20.0, withholding_tax_taxable=100.0)
+    created = MagicMock()
+    created.data.to_dict.return_value = {"id": 2, "number": 9, "date": "2026-03-01"}
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "create_issued_document",
+                      return_value=created) as create, \
+         patch.object(server, "get_client_by_id", return_value=CLIENT_WITH_METHOD):
+        _run(server.call_tool("duplicate_invoice", {
+            "source_document_id": 42, "new_date": "2026-03-01",
+        }))
+
+    assert create.call_args.kwargs["create_issued_document_request"]["options"] == {"fix_payments": True}
+
+
+def test_convert_proforma_copies_document_level_modifiers(server_module):
+    server = server_module
+    proforma = _issued_doc([_rate(1020.0, "2026-02-09")])
+    proforma["type"] = "proforma"
+    proforma["withholding_tax"] = 20.0
+    proforma["withholding_tax_taxable"] = 100.0
+    created = MagicMock()
+    created.data.to_dict.return_value = {"id": 11, "number": 3, "date": "2026-02-01"}
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(proforma)), \
+         patch.object(server.issued_api, "create_issued_document",
+                      return_value=created) as create, \
+         patch.object(server.issued_api, "delete_issued_document"), \
+         patch.object(server, "get_client_by_id", return_value=CLIENT_WITH_METHOD):
+        _run(server.call_tool("convert_proforma_to_invoice", {"document_id": 10}))
+
+    request = create.call_args.kwargs["create_issued_document_request"]
+    assert request["data"]["withholding_tax"] == 20.0
+    assert request["options"] == {"fix_payments": True}
+
+
+def test_update_document_without_installments_does_not_write_a_zero(server_module):
+    """The sum of no installments is not a total."""
+    server = server_module
+    doc = _issued_doc([])
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document",
+                      return_value=_doc_response(doc)) as modify, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme"}):
+        _run(server.call_tool("update_document", {
+            "document_id": 42, "visible_subject": "Nuovo",
+        }))
+
+    sent = _sent_payments(modify, "modify_issued_document_request")
+    assert sent[0]["amount"] == 1220.0
+
+
+def test_update_document_reports_the_stored_total(server_module):
+    """The response asserted a total computed from the lines, i.e. the number
+    the installment stopped carrying."""
+    server = server_module
+    doc = _withholding_doc()
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme"}):
+        result = _run(server.call_tool("update_document", {
+            "document_id": 42, "visible_subject": "Nuovo",
+        }))
+
+    assert json.loads(result[0].text)["total"] == 1020.0
+
+
+def test_update_document_allows_item_edits_with_only_a_taxable_base(server_module):
+    """A taxable base is not a rate: on its own it changes no total, and
+    refusing on it would refuse every item edit."""
+    server = server_module
+    doc = _issued_doc([_rate(1220.0, "2026-02-09")])
+    doc["withholding_tax_taxable"] = 100.0
+    doc["global_cassa_taxable"] = 100.0
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document",
+                      return_value=_doc_response(doc)) as modify, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme"}):
+        result = _run(server.call_tool("update_document", {
+            "document_id": 42,
+            "items": [{"name": "Item", "qty": 1, "net_price": 1000.0, "vat_rate": 22}],
+        }))
+
+    assert modify.called
+    assert json.loads(result[0].text)["success"] is True

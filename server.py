@@ -316,15 +316,24 @@ def _payment_days_argument(value, default=30):
 # cassa previdenziale, rivalsa INPS, marca da bollo, split payment). The local
 # total only models the lines, so a document carrying any of these has a total
 # this server cannot reproduce.
-AMOUNT_MODIFIERS = (
-    "rivalsa", "cassa", "cassa_taxable", "cassa2", "cassa2_taxable",
-    "global_cassa_taxable", "withholding_tax", "withholding_tax_taxable",
+AMOUNT_MODIFIER_RATES = (
+    "rivalsa", "cassa", "cassa2", "withholding_tax",
     "other_withholding_tax", "stamp_duty", "use_split_payment",
 )
+# The taxable bases those rates apply to. FIC values them independently of the
+# rate, so they answer nothing about whether the total moved — they only have
+# to travel with a copy of the document.
+AMOUNT_MODIFIER_BASES = (
+    "cassa_taxable", "cassa2_taxable", "global_cassa_taxable",
+    "withholding_tax_taxable",
+)
+AMOUNT_MODIFIERS = AMOUNT_MODIFIER_RATES + AMOUNT_MODIFIER_BASES
 
 
-def _amount_modifiers_of(doc):
-    return {k: doc[k] for k in AMOUNT_MODIFIERS if doc.get(k) not in (None, 0, 0.0, False)}
+def _amount_modifiers_of(doc, fields=AMOUNT_MODIFIERS):
+    """Document-level amounts to copy. Pass AMOUNT_MODIFIER_RATES to ask the
+    narrower question: does this document have a total the lines do not give?"""
+    return {k: doc[k] for k in fields if doc.get(k) not in (None, 0, 0.0, False)}
 
 
 def _ei_data_of(doc, default_payment_method=None):
@@ -568,21 +577,23 @@ def build_issued_document(doc_type, client_id, items_data, date_str, payment_day
 
     if revenue_center:
         body_data["rc_center"] = revenue_center
+    client_method = client_data.get("default_payment_method") or {}
+    if client_method.get("id"):
+        body_data["payment_method"] = {"id": client_method["id"]}
     if doc_type in ("invoice", "credit_note"):
         body_data["e_invoice"] = True
-        client_method = client_data.get("default_payment_method") or {}
         body_data["ei_data"] = {
             "payment_method": client_method.get("ei_payment_method") or "MP05"
         }
-        if client_method.get("id"):
-            body_data["payment_method"] = {"id": client_method["id"]}
     # `original_document` is not a writable field: it is absent from the spec's
     # IssuedDocument schema and the SDK model drops it, so the link was never
     # made. FIC links documents through /issued_documents/transform.
 
     response = issued_api.create_issued_document(
         company_id=COMPANY_ID,
-        create_issued_document_request={"data": body_data}
+        # the local total models the lines only: let FIC size the installment
+        # from the document it builds (ritenuta, cassa, rivalsa, bollo)
+        create_issued_document_request={"data": body_data, "options": {"fix_payments": True}}
     )
     d = response.data.to_dict()
 
@@ -1331,9 +1342,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             # an explicit null is not an omitted field: only send what exists
             if (orig.get("payment_method") or {}).get("id"):
                 body_data["payment_method"] = {"id": orig["payment_method"]["id"]}
+            # the lines carry apply_withholding_taxes: without the document-level
+            # percentages the invoice is due a different amount than the proforma
+            body_data.update(_amount_modifiers_of(orig))
             if revenue_center:
                 body_data["rc_center"] = revenue_center
-            body = {"data": body_data}
+            body = {"data": body_data, "options": {"fix_payments": True}}
 
             response = issued_api.create_issued_document(
                 company_id=COMPANY_ID, create_issued_document_request=body
@@ -1447,7 +1461,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             # magnitude comparison.
             items_edited = "items" in arguments
             total_moved = items_edited and round(total_abs, 2) != abs(existing_total)
-            modifiers = _amount_modifiers_of(orig)
+            if existing_payments and not items_edited:
+                # the lines were not touched, so the document's total is the one
+                # FIC stored, not the one the lines add up to
+                result_total = -abs(existing_total) if is_credit_note else existing_total
+            modifiers = _amount_modifiers_of(orig, AMOUNT_MODIFIER_RATES)
             if items_edited and modifiers:
                 return _error(
                     f"Il documento ha importi calcolati a livello documento ({modifiers}): "
@@ -1495,8 +1513,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 payments_list = [payment]
             else:
                 payments_list = [{
-                    # with the lines untouched the amount is the document's own
-                    "amount": round(total_abs, 2) if items_edited else existing_total,
+                    # with the lines untouched the amount is the document's own,
+                    # unless it stores none: the sum of nothing is not a total
+                    "amount": (existing_total if existing_payments and not items_edited
+                               else round(total_abs, 2)),
                     "due_date": due_date.strftime("%Y-%m-%d"),
                     "status": "not_paid",
                     "payment_terms": {"days": payment_days, "type": payment_terms_type}
@@ -1618,7 +1638,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             body_data.update(_amount_modifiers_of(orig))
             if revenue_center:
                 body_data["rc_center"] = revenue_center
-            body = {"data": body_data}
+            body = {"data": body_data, "options": {"fix_payments": True}}
             response = issued_api.create_issued_document(
                 company_id=COMPANY_ID, create_issued_document_request=body
             )

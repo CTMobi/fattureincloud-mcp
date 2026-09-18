@@ -2230,11 +2230,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             stored = updated.get("payments_list")
             if stored is not None and not stored:
                 # `or` used to treat this like an omitted field and report the
-                # installments we sent: a payment the document does not carry
+                # installments we sent: a state the document does not carry
+                perso = ("il pagamento non risulta registrato" if status == "paid"
+                         else "il documento ha perso il piano rate")
                 return _error(
-                    f"Il documento {doc_id} è tornato dall'API senza scadenze: il pagamento "
-                    f"non risulta registrato. Verificalo dal pannello FattureInCloud prima "
-                    f"di riprovare."
+                    f"Il documento {doc_id} è tornato dall'API senza scadenze: {perso}. "
+                    f"Verificalo dal pannello FattureInCloud prima di riprovare."
                 )
 
             account_names = {a["id"]: a["name"] for a in fetch_payment_accounts(company_id=COMPANY_ID)}
@@ -2265,6 +2266,15 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             # The response is the document as stored, so check it rather than
             # reporting a clean success over a document that lost its content.
             warning = None
+            if stored is None:
+                # to_dict() drops keys whose value is None, so the schedule may
+                # simply not have been reported: the rows below are then the ones
+                # sent, and saying so is the difference from claiming they were read
+                warning = (
+                    "La risposta dell'API non riporta le scadenze: le rate qui sotto sono "
+                    "quelle inviate, non quelle rilette dal documento. Verificale dal "
+                    "pannello FattureInCloud."
+                )
             if doc_kind == "received" and (d.get("entity") or {}) and updated.get("entity") == {}:
                 warning = (
                     "Il documento è tornato dall'API senza fornitore: la PUT potrebbe aver "
@@ -2421,8 +2431,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         # stderr, where whoever runs the server can read it
         print(f"[{name}] {traceback.format_exc()}", file=sys.stderr)
         if isinstance(e, ApiException):
-            # what FIC refused is exactly what the caller has to act on
-            return _error(f"{type(e).__name__}: {e}")
+            # what FIC refused is exactly what the caller has to act on; str(e)
+            # would add the response headers, which help nobody
+            detail = f"{e.status} {e.reason}"
+            if e.body:
+                detail += f": {e.body}"
+            return _error(f"{type(e).__name__}: {detail}")
         return _error(
             f"{type(e).__name__} durante '{name}'. Il dettaglio è nel log del server."
         )

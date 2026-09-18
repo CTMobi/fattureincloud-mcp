@@ -429,11 +429,13 @@ def test_set_payment_received_without_installments_creates_one(server_module):
     """Documents created by create_received_document carry no payments_list."""
     server = server_module
     doc = _received_doc([])
+    stored = _received_doc([_rate(610.0, "2026-01-10", status="paid",
+                                  paid_date="2026-02-05")])
 
     with patch.object(server.received_api, "get_received_document",
                       return_value=_doc_response(doc)), \
          patch.object(server.received_api, "modify_received_document",
-                      return_value=_doc_response(doc)) as modify:
+                      return_value=_doc_response(stored)) as modify:
         _run(server.call_tool("set_payment", {
             "document_id": 99, "document_type": "received", "status": "paid",
             "paid_date": "2026-02-05",
@@ -695,11 +697,14 @@ def test_set_payment_received_amount_falls_back_to_net_plus_vat(server_module):
     server = server_module
     doc = ReceivedDocument.from_dict(_received_doc([])).to_dict()
     assert "amount_gross" not in doc
+    stored = ReceivedDocument.from_dict(
+        _received_doc([_rate(610.0, "2026-01-10", status="paid")])
+    ).to_dict()
 
     with patch.object(server.received_api, "get_received_document",
                       return_value=_doc_response(doc)), \
          patch.object(server.received_api, "modify_received_document",
-                      return_value=_doc_response(doc)) as modify:
+                      return_value=_doc_response(stored)) as modify:
         _run(server.call_tool("set_payment", {
             "document_id": 99, "document_type": "received", "status": "paid",
             "paid_date": "2026-02-05",
@@ -3159,11 +3164,15 @@ def test_set_payment_synthesizes_an_installment_net_of_withholding(server_module
     the amount the payment registers."""
     server = server_module
     doc = _sdk_received(dict(_received_doc([]), amount_withholding_tax=100.0))
+    stored = _sdk_received(dict(
+        _received_doc([_rate(510.0, "2026-01-10", status="paid")]),
+        amount_withholding_tax=100.0,
+    ))
 
     with patch.object(server.received_api, "get_received_document",
                       return_value=_doc_response(doc)), \
          patch.object(server.received_api, "modify_received_document",
-                      return_value=_doc_response(doc)) as modify:
+                      return_value=_doc_response(stored)) as modify:
         _run(server.call_tool("set_payment", {
             "document_id": 99, "document_type": "received", "status": "paid",
             "paid_date": "2026-02-05",
@@ -3331,11 +3340,15 @@ def test_set_payment_rounds_the_synthesized_amount(server_module):
     0.30000000000000004."""
     server = server_module
     doc = _sdk_received(dict(_received_doc([]), amount_net=0.1, amount_vat=0.2))
+    stored = _sdk_received(dict(
+        _received_doc([_rate(0.3, "2026-01-10", status="paid")]),
+        amount_net=0.1, amount_vat=0.2,
+    ))
 
     with patch.object(server.received_api, "get_received_document",
                       return_value=_doc_response(doc)), \
          patch.object(server.received_api, "modify_received_document",
-                      return_value=_doc_response(doc)) as modify:
+                      return_value=_doc_response(stored)) as modify:
         _run(server.call_tool("set_payment", {
             "document_id": 99, "document_type": "received", "status": "paid",
         }))
@@ -3616,3 +3629,66 @@ def test_an_api_error_reaches_the_caller_but_an_internal_one_does_not(server_mod
     assert "RuntimeError" in internal["error"]
     assert "/home/someone/secret.py" not in internal["error"]
     assert "secret.py" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
+# review round 34
+# --------------------------------------------------------------------------
+
+def test_set_payment_flags_a_response_that_did_not_report_the_installments(server_module):
+    """to_dict() omits keys whose value is None, so a modify response that does
+    not carry the schedule arrives as a missing key, not as an empty list."""
+    server = server_module
+    doc = _sdk_received(_received_doc([_rate(610.0, "2026-02-09")]))
+    silent = {k: v for k, v in _sdk_received(_received_doc([])).items()
+              if k != "payments_list"}
+
+    with patch.object(server.received_api, "get_received_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.received_api, "modify_received_document",
+                      return_value=_doc_response(silent)):
+        result = _run(server.call_tool("set_payment", {
+            "document_id": 99, "document_type": "received", "status": "paid",
+        }))
+
+    payload = json.loads(result[0].text)
+    assert payload["success"] is True
+    assert "inviate" in payload["warning"]
+
+
+def test_set_payment_names_the_lost_schedule_when_clearing(server_module):
+    """Clearing a payment and getting no installments back does not mean the
+    payment was not registered: it means the plan is gone."""
+    server = server_module
+    doc = _sdk_received(_received_doc([_rate(610.0, "2026-02-09", status="paid",
+                                             paid_date="2026-02-09")]))
+    wiped = _sdk_received(_received_doc([]))
+
+    with patch.object(server.received_api, "get_received_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.received_api, "modify_received_document",
+                      return_value=_doc_response(wiped)):
+        result = _run(server.call_tool("set_payment", {
+            "document_id": 99, "document_type": "received", "status": "not_paid",
+        }))
+
+    error = json.loads(result[0].text)["error"]
+    assert "piano rate" in error
+    assert "non risulta registrato" not in error
+
+
+def test_an_api_error_does_not_carry_the_response_headers(server_module):
+    """status, reason and body are what the caller acts on; the headers of the
+    FIC response help nobody and travel into the conversation."""
+    from fattureincloud_python_sdk.exceptions import ApiException
+    server = server_module
+    error = ApiException(status=422, reason="Unprocessable")
+    error.body = '{"error":"vat_id not found"}'
+    error.headers = {"x-request-id": "abc123", "set-cookie": "session=zzz"}
+
+    with patch.object(server.issued_api, "list_issued_documents", side_effect=error):
+        payload = json.loads(_run(server.call_tool("list_invoices", {"year": 2026}))[0].text)
+
+    assert "422" in payload["error"]
+    assert "vat_id not found" in payload["error"]
+    assert "session=zzz" not in payload["error"]

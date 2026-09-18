@@ -2436,10 +2436,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         if isinstance(e, ApiException):
             # what FIC refused is exactly what the caller has to act on; str(e)
             # would add the response headers, which help nobody
-            detail = f"{e.status} {e.reason}"
+            # these four belong to the generated runtime, not to a declared API:
+            # an AttributeError raised here would escape call_tool and leave the
+            # client without a response at all
+            detail = f"{getattr(e, 'status', None)} {getattr(e, 'reason', None)}"
             # __init__ fills body from the raw response, but leaves it None when
             # that decode raises: the refusal is then only in the parsed data
-            refusal = e.data or e.body
+            refusal = getattr(e, "data", None) or getattr(e, "body", None)
             if refusal:
                 detail += f": {refusal}"
             return _error(f"{type(e).__name__}: {detail}")

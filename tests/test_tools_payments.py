@@ -3733,3 +3733,24 @@ def test_an_api_error_falls_back_to_the_deserialized_body(server_module):
         payload = json.loads(_run(server.call_tool("list_invoices", {"year": 2026}))[0].text)
 
     assert "vat_id not found" in payload["error"]
+
+
+# --------------------------------------------------------------------------
+# review round 36
+# --------------------------------------------------------------------------
+
+def test_an_api_error_without_the_expected_attributes_still_answers(server_module):
+    """status / reason / body / data belong to the generated runtime, not to a
+    declared API: an AttributeError raised inside the except would escape
+    call_tool and leave the client with no response at all."""
+    from fattureincloud_python_sdk.exceptions import ApiException
+
+    class Sparse(ApiException):
+        def __init__(self):
+            pass  # a future runtime that stops setting them
+
+    server = server_module
+    with patch.object(server.issued_api, "list_issued_documents", side_effect=Sparse()):
+        result = _run(server.call_tool("list_invoices", {"year": 2026}))
+
+    assert json.loads(result[0].text)["success"] is False

@@ -3323,3 +3323,125 @@ def test_get_situation_reads_the_same_way_on_both_sides(server_module):
     assert payload["costi_lordi"] == 1220.0
     assert payload["note_fornitore"] == 305.0
     assert payload["costi_totali"] == 915.0
+
+
+# --------------------------------------------------------------------------
+# review round 28
+# --------------------------------------------------------------------------
+
+def test_set_payment_is_annotated_destructive(server_module):
+    """status=not_paid drops paid_date and payment_account, which the server
+    cannot reconstruct: destructiveHint is what a client reads to ask first."""
+    server = server_module
+    tool = next(t for t in _run(server.list_tools()) if t.name == "set_payment")
+    assert tool.annotations.destructiveHint is True
+
+
+def test_set_payment_rounds_the_synthesized_amount(server_module):
+    """Every other write path rounds currency; a raw float reaches FIC as
+    0.30000000000000004."""
+    server = server_module
+    doc = _sdk_received(dict(_received_doc([]), amount_net=0.1, amount_vat=0.2))
+
+    with patch.object(server.received_api, "get_received_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.received_api, "modify_received_document",
+                      return_value=_doc_response(doc)) as modify:
+        _run(server.call_tool("set_payment", {
+            "document_id": 99, "document_type": "received", "status": "paid",
+        }))
+
+    assert _sent_payments(modify, "modify_received_document_request")[0]["amount"] == 0.3
+
+
+def test_update_document_echoes_the_document_payment_method(server_module):
+    """convert_proforma_to_invoice and duplicate_invoice echo it; if the PUT is
+    not a merge, an unrelated edit clears it and leaves ei_data declaring a
+    method the document no longer has."""
+    server = server_module
+    doc = _sdk_shaped(dict(
+        _issued_doc([_rate(1220.0, "2026-02-09")]),
+        payment_method={"id": 17, "name": "Bonifico"},
+    ))
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document",
+                      return_value=_doc_response(doc)) as modify, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme", "ei_code": "A1"}):
+        _run(server.call_tool("update_document", {
+            "document_id": 42, "visible_subject": "Nuovo oggetto",
+        }))
+
+    assert _sent_data(modify, "modify_issued_document_request")["payment_method"] == {"id": 17}
+
+
+@pytest.mark.parametrize("arguments", [
+    {"year": "2026'; drop"},
+    {"year": 0},
+    {"year": True},
+    {"year": 2026, "month": "gennaio"},
+    {"year": 2026, "month": 13},
+    {"year": 2026, "month": 0},
+])
+def test_list_invoices_refuses_a_malformed_period(server_module, arguments):
+    """year and month are interpolated into the FIC query filter, and month
+    reaches {month:02d}: a string used to come back as a TypeError traceback."""
+    server = server_module
+    with patch.object(server.issued_api, "list_issued_documents") as listed:
+        result = _run(server.call_tool("list_invoices", arguments))
+
+    assert not listed.called
+    payload = json.loads(result[0].text)
+    assert payload["success"] is False
+    assert "Traceback" not in result[0].text
+
+
+def test_list_invoices_defaults_to_the_current_year(server_module):
+    """The other three period tools use datetime.now().year; this one was
+    pinned to 2024."""
+    server = server_module
+    listed = MagicMock()
+    listed.data = []
+    listed.last_page = 1
+
+    with patch.object(server.issued_api, "list_issued_documents",
+                      return_value=listed) as call:
+        _run(server.call_tool("list_invoices", {}))
+
+    assert str(datetime.now().year) in call.call_args.kwargs["q"]
+
+
+def test_get_situation_caps_the_pages_it_reads(server_module):
+    """Four detailed lists paged to the end is dozens of sequential calls
+    against a rate-limited API; a capped total says it is partial."""
+    server = server_module
+    page = MagicMock()
+    page.data = []
+    page.last_page = 500
+
+    with patch.object(server.issued_api, "list_issued_documents",
+                      return_value=page) as issued, \
+         patch.object(server.received_api, "list_received_documents",
+                      return_value=page) as received:
+        result = _run(server.call_tool("get_situation", {"year": 2026}))
+
+    assert json.loads(result[0].text)["parziale"] is True
+    assert issued.call_count + received.call_count <= 4 * server.MAX_PAGES
+
+
+def test_check_numeration_says_when_it_did_not_read_the_whole_year(server_module):
+    """A capped read invents gaps: the invoices it never fetched look missing."""
+    server = server_module
+    doc = MagicMock()
+    doc.to_dict.return_value = {"number": 1, "date": "2026-01-10"}
+    page = MagicMock()
+    page.data = [doc]
+    page.last_page = 500
+
+    with patch.object(server.issued_api, "list_issued_documents", return_value=page):
+        result = _run(server.call_tool("check_numeration", {"year": 2026}))
+
+    payload = json.loads(result[0].text)
+    assert payload["parziale"] is True
+    assert "parziale" in payload["nota"].lower() or "buchi" in payload["nota"].lower()

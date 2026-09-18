@@ -39,6 +39,10 @@ def _ann(read_only=False, destructive=False, idempotent=False, open_world=True):
     )
 
 # ReceivedDocumentType, from the official OpenAPI spec
+# ponytail: a flat ceiling on the pages a single tool call reads; per-list
+# tuning only if a real company hits it
+MAX_PAGES = 10
+
 RECEIVED_DOCUMENT_TYPES = ("expense", "passive_credit_note", "passive_delivery_note", "self_invoice")
 
 ACCESS_TOKEN = os.getenv("FIC_ACCESS_TOKEN", "")
@@ -158,8 +162,10 @@ def resolve_payment_account(value):
                       "riprova, senza non si può indicare il conto.")
     names = [a["name"] for a in accounts]
 
-    if isinstance(value, int) and not isinstance(value, bool) or \
-            (isinstance(value, str) and value.strip().isascii() and value.strip().isdigit()):
+    is_id = (isinstance(value, int) and not isinstance(value, bool)) or (
+        isinstance(value, str) and value.strip().isascii() and value.strip().isdigit()
+    )
+    if is_id:
         wanted = int(value)
         for a in accounts:
             if a["id"] == wanted:
@@ -266,16 +272,20 @@ def _received_document_type(value):
     return doc_type, None
 
 
-def _all_pages(api_call, **kwargs):
+def _all_pages(api_call, *, max_pages=MAX_PAGES, **kwargs):
     """Every list endpoint caps `per_page` at 100 (OpenAPI v2.1.8), so a single
     call is not a year of documents. Follow `last_page` instead of reporting a
-    partial total."""
+    partial total, but stop at `max_pages`: a caller that reads four lists would
+    otherwise make dozens of sequential requests against a rate-limited API.
+    `last_page` is read once — a document created while paging shifts the pages,
+    which an annual dashboard tolerates. Returns (docs, truncated)."""
     response = api_call(per_page=100, page=1, **kwargs)
     docs = list(response.data or [])
-    for page in range(2, _page_count(response) + 1):
+    pages = _page_count(response)
+    for page in range(2, min(pages, max_pages) + 1):
         page_response = api_call(per_page=100, page=page, **kwargs)
         docs.extend(page_response.data or [])
-    return docs
+    return docs, pages > max_pages
 
 
 def _iso_date(value, field="date", default=None):
@@ -287,6 +297,27 @@ def _iso_date(value, field="date", default=None):
         return datetime.strptime(str(raw).strip(), "%Y-%m-%d"), None
     except (TypeError, ValueError):
         return None, f"{field} '{raw}' non valida: usa il formato YYYY-MM-DD."
+
+
+def _year_argument(value):
+    """Validate the `year` argument. It is interpolated into the `q` filter, so
+    it is judged here rather than trusted from the JSON schema. Returns
+    (year, error); a null means the current year."""
+    if value is None:
+        return datetime.now().year, None
+    if isinstance(value, bool) or not isinstance(value, int) or not 1900 <= value <= 2100:
+        return None, f"year = {value!r}: serve un anno fra 1900 e 2100."
+    return value, None
+
+
+def _month_argument(value):
+    """Validate the `month` argument. Returns (month, error); a null means the
+    whole year. A string used to reach `{month:02d}` and raise TypeError."""
+    if value is None:
+        return None, None
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 12:
+        return None, f"month = {value!r}: serve un intero fra 1 e 12."
+    return value, None
 
 
 def _page_argument(value):
@@ -1027,7 +1058,9 @@ async def list_tools():
                 },
                 "required": ["document_id", "document_type", "status"]
             },
-            annotations=_ann(idempotent=True),
+            # status="not_paid" drops paid_date and payment_account, which this
+            # server cannot reconstruct: the same tool registers and clears
+            annotations=_ann(destructive=True, idempotent=True),
         ),
         Tool(
             name="get_received_document",
@@ -1072,8 +1105,12 @@ async def list_tools():
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     try:
         if name == "list_invoices":
-            year = arguments.get("year", 2024)
-            month = arguments.get("month")
+            year, year_error = _year_argument(arguments.get("year"))
+            if year_error:
+                return _error(year_error)
+            month, month_error = _month_argument(arguments.get("month"))
+            if month_error:
+                return _error(month_error)
             query = arguments.get("query")
             doc_type = arguments.get("type", "invoice")
 
@@ -1581,6 +1618,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "items_list": items_list,
                 "payments_list": payments_list
             }
+            if (orig.get("payment_method") or {}).get("id"):
+                body_data["payment_method"] = {"id": orig["payment_method"]["id"]}
             if revenue_center:
                 body_data["rc_center"] = revenue_center
             if orig.get("show_totals"):
@@ -1833,8 +1872,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
 
         elif name == "list_received_documents":
-            year = arguments.get("year", datetime.now().year)
-            month = arguments.get("month")
+            year, year_error = _year_argument(arguments.get("year"))
+            if year_error:
+                return _error(year_error)
+            month, month_error = _month_argument(arguments.get("month"))
+            if month_error:
+                return _error(month_error)
             doc_type, type_error = _received_document_type(arguments.get("type", "expense"))
             if type_error:
                 return _error(type_error)
@@ -1876,18 +1919,21 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text=json.dumps(payload, indent=2, ensure_ascii=False))]
 
         elif name == "get_situation":
-            year = arguments.get("year", datetime.now().year)
+            year, year_error = _year_argument(arguments.get("year"))
+            if year_error:
+                return _error(year_error)
             client_filter = (arguments.get("client_name") or "").lower().strip()
             q = f"date >= '{year}-01-01' and date <= '{year}-12-31'"
 
-            emesse = _all_pages(
+            emesse, parziale = _all_pages(
                 issued_api.list_issued_documents,
                 company_id=COMPANY_ID, type="invoice", q=q, fieldset="detailed"
             )
-            note_credito = _all_pages(
+            note_credito, truncated = _all_pages(
                 issued_api.list_issued_documents,
                 company_id=COMPANY_ID, type="credit_note", q=q, fieldset="detailed"
             )
+            parziale = parziale or truncated
 
             totale_fatturato = totale_incassato = totale_ndc = 0
             fatture_non_pagate = []
@@ -1921,14 +1967,15 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
             totale_costi = totale_note_fornitore = 0
             if not client_filter:
-                ricevute = _all_pages(
+                ricevute, costi_truncated = _all_pages(
                     received_api.list_received_documents,
                     company_id=COMPANY_ID, type="expense", q=q, fieldset="detailed"
                 )
-                note_fornitore = _all_pages(
+                note_fornitore, note_truncated = _all_pages(
                     received_api.list_received_documents,
                     company_id=COMPANY_ID, type="passive_credit_note", q=q, fieldset="detailed"
                 )
+                parziale = parziale or costi_truncated or note_truncated
                 # revenue is gross (it comes from the installments), so costs have
                 # to be gross too or the margin absorbs the purchase VAT; and a
                 # supplier credit note reduces them, as an issued one reduces
@@ -1952,19 +1999,28 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "costi_totali": round(totale_costi, 2) if not client_filter else "N/A (filtro cliente attivo)",
                 "note_fornitore": round(totale_note_fornitore, 2) if not client_filter else "N/A (filtro cliente attivo)",
                 "margine_lordo": round(fatturato_netto - totale_costi, 2) if not client_filter else "N/A",
-                "prossime_scadenze": fatture_non_pagate[:10]
+                "prossime_scadenze": fatture_non_pagate[:10],
             }
+            if parziale:
+                # the totals are real but incomplete: say so rather than let a
+                # capped read look like the whole year
+                result["parziale"] = True
+                result["nota"] = (
+                    f"Lette al massimo {MAX_PAGES} pagine da 100 documenti per lista: "
+                    f"l'anno {year} ne contiene di più, quindi i totali sono parziali."
+                )
             return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
 
         elif name == "check_numeration":
-            year = arguments.get("year", datetime.now().year)
+            year, year_error = _year_argument(arguments.get("year"))
+            if year_error:
+                return _error(year_error)
             q = f"date >= '{year}-01-01' and date <= '{year}-12-31'"
-            docs = [
-                d.to_dict() for d in _all_pages(
-                    issued_api.list_issued_documents,
-                    company_id=COMPANY_ID, type="invoice", q=q
-                )
-            ]
+            listed, parziale = _all_pages(
+                issued_api.list_issued_documents,
+                company_id=COMPANY_ID, type="invoice", q=q
+            )
+            docs = [d.to_dict() for d in listed]
             if not docs:
                 return [TextContent(type="text", text=json.dumps({
                     "year": year, "status": "Nessuna fattura trovata per questo anno"
@@ -1993,6 +2049,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "status": "✓ Numerazione continua" if len(gaps) == 0 else f"⚠ Trovati {len(gaps)} problemi",
                 "gaps": gaps
             }
+            if parziale:
+                # the invoices that were never fetched read as missing numbers
+                result["parziale"] = True
+                result["nota"] = (
+                    f"Lette al massimo {MAX_PAGES} pagine da 100 fatture: la verifica è "
+                    f"parziale e i buchi elencati possono essere fatture non lette."
+                )
             return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
 
         elif name == "list_cost_centers":
@@ -2047,7 +2110,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     return _error(
                         f"Documento {doc_id} senza scadenze di pagamento: impossibile registrare l'incasso."
                     )
-                amount = _amount_due_of(d)
+                amount = round(_amount_due_of(d), 2)
                 ritenuta = round(_gross_of(d) - amount, 2)
                 if ritenuta:
                     nota_importo = (

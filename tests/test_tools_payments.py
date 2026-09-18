@@ -3526,3 +3526,30 @@ def test_set_payment_always_says_when_it_invented_the_installment(server_module)
     nota = json.loads(result[0].text)["nota_importo"]
     assert "610" in nota
     assert "ritenuta" not in nota.lower()
+
+
+# --------------------------------------------------------------------------
+# review round 30
+# --------------------------------------------------------------------------
+
+def test_check_numeration_does_not_raise_an_alarm_it_did_not_verify(server_module):
+    """A truncated read produces missing numbers almost by construction: the
+    branch with gaps is the likely one, not the exception."""
+    server = server_module
+    docs = []
+    for number in (1, 5):
+        doc = MagicMock()
+        doc.to_dict.return_value = {"number": number, "date": "2026-01-10"}
+        docs.append(doc)
+    page = MagicMock()
+    page.data = docs
+    page.last_page = 500
+
+    with patch.object(server.issued_api, "list_issued_documents", return_value=page):
+        result = _run(server.call_tool("check_numeration", {"year": 2026}))
+
+    payload = json.loads(result[0].text)
+    assert payload["parziale"] is True
+    assert payload["gaps"]
+    assert "⚠" not in payload["status"]
+    assert "parziale" in payload["status"].lower()

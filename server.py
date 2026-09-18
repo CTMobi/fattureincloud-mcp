@@ -2057,10 +2057,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 # a truncated read verified nothing about the invoices it never
                 # fetched: continuous would assert exactly that
                 "continuous": None if parziale else len(gaps) == 0,
-                "status": ("? Verifica parziale: nessun buco fra le fatture lette"
-                           if parziale and not gaps else
-                           f"⚠ Trovati {len(gaps)} problemi" if gaps else
-                           "✓ Numerazione continua"),
+                "status": (
+                    ("? Verifica parziale: "
+                     + (f"{len(gaps)} possibili buchi fra le fatture lette" if gaps
+                        else "nessun buco fra le fatture lette"))
+                    if parziale else
+                    f"⚠ Trovati {len(gaps)} problemi" if gaps else
+                    "✓ Numerazione continua"
+                ),
                 "gaps": gaps
             }
             if parziale:

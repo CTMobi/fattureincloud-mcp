@@ -3553,3 +3553,16 @@ def test_check_numeration_does_not_raise_an_alarm_it_did_not_verify(server_modul
     assert payload["gaps"]
     assert "⚠" not in payload["status"]
     assert "parziale" in payload["status"].lower()
+
+
+# --------------------------------------------------------------------------
+# review round 32
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("tool_name", ["get_situation", "check_numeration"])
+def test_the_aggregating_tools_announce_a_partial_read(server_module, tool_name):
+    """The model reads the description, not the README: parziale must not be
+    the first time it hears the year might not have been read whole."""
+    server = server_module
+    tool = next(t for t in _run(server.list_tools()) if t.name == tool_name)
+    assert "parziale" in tool.description

@@ -999,7 +999,7 @@ async def list_tools():
         ),
         Tool(
             name="get_situation",
-            description="Dashboard anno: fatturato netto (fatture - NDC), incassato, da incassare, costi, margine. Supporta filtro per cliente.",
+            description="Dashboard anno: fatturato netto (fatture - NDC), incassato, da incassare, costi (lordi, note fornitore, totale), margine. Supporta filtro per cliente. Legge al massimo 10 pagine da 100 documenti per lista: oltre quel tetto la risposta porta parziale=true e i totali sono incompleti.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1011,7 +1011,7 @@ async def list_tools():
         ),
         Tool(
             name="check_numeration",
-            description="Verifica continuità numerica delle fatture emesse per un dato anno.",
+            description="Verifica continuità numerica delle fatture emesse per un dato anno. Legge al massimo 10 pagine da 100 fatture: oltre quel tetto la risposta porta parziale=true e continuous=null, e i buchi elencati possono essere fatture non lette.",
             inputSchema={
                 "type": "object",
                 "properties": {

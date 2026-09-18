@@ -40,8 +40,8 @@ MCP server that connects Claude (Desktop, Code, or any MCP client) to **FattureI
 | `list_cost_centers` | List configured cost / revenue centers |
 | `list_payment_accounts` | List configured payment accounts (banks, cash, cards) |
 | `set_payment` | Register / clear a payment on an issued or received document |
-| `get_situation` | Yearly dashboard: net revenue, collected, outstanding, costs, margin |
-| `check_numeration` | Verify invoice numbering continuity |
+| `get_situation` | Yearly dashboard: net revenue, collected, outstanding, costs, margin (10 pages per list, see `parziale`) |
+| `check_numeration` | Verify invoice numbering continuity (10 pages, see `parziale` and `continuous: null`) |
 
 
 ## Installation

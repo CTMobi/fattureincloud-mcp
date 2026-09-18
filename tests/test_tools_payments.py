@@ -3218,11 +3218,16 @@ def test_set_payment_explains_the_synthesized_amount(server_module):
         amount_withholding_tax=100.0,
         amount_other_withholding_tax=10.0,
     ))
+    stored = _sdk_received(dict(
+        _received_doc([_rate(500.0, "2026-01-10", status="paid")]),
+        amount_withholding_tax=100.0,
+        amount_other_withholding_tax=10.0,
+    ))
 
     with patch.object(server.received_api, "get_received_document",
                       return_value=_doc_response(doc)), \
          patch.object(server.received_api, "modify_received_document",
-                      return_value=_doc_response(doc)) as modify:
+                      return_value=_doc_response(stored)) as modify:
         result = _run(server.call_tool("set_payment", {
             "document_id": 99, "document_type": "received", "status": "paid",
             "paid_date": "2026-02-05",
@@ -3444,7 +3449,7 @@ def test_an_unexpected_error_does_not_return_a_traceback(server_module, capsys):
     assert payload["success"] is False
     assert "Traceback" not in result[0].text
     assert "site-packages" not in result[0].text
-    assert "boom" in payload["error"]
+    assert "RuntimeError" in payload["error"]
     # the detail is still available to whoever runs the server
     assert "Traceback" in capsys.readouterr().err
 
@@ -3514,11 +3519,12 @@ def test_set_payment_always_says_when_it_invented_the_installment(server_module)
     one, withholding or not."""
     server = server_module
     doc = _sdk_received(_received_doc([]))
+    stored = _sdk_received(_received_doc([_rate(610.0, "2026-01-10", status="paid")]))
 
     with patch.object(server.received_api, "get_received_document",
                       return_value=_doc_response(doc)), \
          patch.object(server.received_api, "modify_received_document",
-                      return_value=_doc_response(doc)):
+                      return_value=_doc_response(stored)):
         result = _run(server.call_tool("set_payment", {
             "document_id": 99, "document_type": "received", "status": "paid",
         }))
@@ -3566,3 +3572,47 @@ def test_the_aggregating_tools_announce_a_partial_read(server_module, tool_name)
     server = server_module
     tool = next(t for t in _run(server.list_tools()) if t.name == tool_name)
     assert "parziale" in tool.description
+
+
+# --------------------------------------------------------------------------
+# review round 33
+# --------------------------------------------------------------------------
+
+def test_set_payment_does_not_report_a_payment_the_document_does_not_carry(server_module):
+    """`or` treated an explicitly empty payments_list like an omitted one, so a
+    document that came back without the installment was reported as paid."""
+    server = server_module
+    doc = _sdk_received(_received_doc([_rate(610.0, "2026-02-09")]))
+    wiped = _sdk_received(_received_doc([]))
+
+    with patch.object(server.received_api, "get_received_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.received_api, "modify_received_document",
+                      return_value=_doc_response(wiped)):
+        result = _run(server.call_tool("set_payment", {
+            "document_id": 99, "document_type": "received", "status": "paid",
+        }))
+
+    payload = json.loads(result[0].text)
+    assert payload["success"] is False
+    assert "610" not in json.dumps(payload.get("payments", []))
+
+
+def test_an_api_error_reaches_the_caller_but_an_internal_one_does_not(server_module, capsys):
+    """The FIC rejection is what the caller has to act on; the message of an
+    arbitrary internal exception is not, and can carry local paths."""
+    from fattureincloud_python_sdk.exceptions import ApiException
+    server = server_module
+
+    with patch.object(server.issued_api, "list_issued_documents",
+                      side_effect=ApiException(status=422, reason="vat_id not found")):
+        api = json.loads(_run(server.call_tool("list_invoices", {"year": 2026}))[0].text)
+
+    with patch.object(server.issued_api, "list_issued_documents",
+                      side_effect=RuntimeError("boom at /home/someone/secret.py")):
+        internal = json.loads(_run(server.call_tool("list_invoices", {"year": 2026}))[0].text)
+
+    assert "422" in api["error"] and "vat_id not found" in api["error"]
+    assert "RuntimeError" in internal["error"]
+    assert "/home/someone/secret.py" not in internal["error"]
+    assert "secret.py" in capsys.readouterr().err

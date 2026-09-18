@@ -15,6 +15,7 @@ import traceback
 from datetime import datetime, timedelta
 
 import fattureincloud_python_sdk as fic
+from fattureincloud_python_sdk.exceptions import ApiException
 from fattureincloud_python_sdk.api.issued_documents_api import IssuedDocumentsApi
 from fattureincloud_python_sdk.api.issued_e_invoices_api import IssuedEInvoicesApi
 from fattureincloud_python_sdk.api.received_documents_api import ReceivedDocumentsApi
@@ -2226,10 +2227,20 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 )
             updated = response.data.to_dict()
 
+            stored = updated.get("payments_list")
+            if stored is not None and not stored:
+                # `or` used to treat this like an omitted field and report the
+                # installments we sent: a payment the document does not carry
+                return _error(
+                    f"Il documento {doc_id} è tornato dall'API senza scadenze: il pagamento "
+                    f"non risulta registrato. Verificalo dal pannello FattureInCloud prima "
+                    f"di riprovare."
+                )
+
             account_names = {a["id"]: a["name"] for a in fetch_payment_accounts(company_id=COMPANY_ID)}
             totale_pagato = residuo = 0.0
             view = []
-            for i, p in enumerate(updated.get("payments_list") or payments):
+            for i, p in enumerate(stored or payments):
                 entry = _payment_entry(p)
                 amount = entry.get("amount") or 0
                 row = {
@@ -2409,7 +2420,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         # client feeds whatever comes back into the conversation: it belongs on
         # stderr, where whoever runs the server can read it
         print(f"[{name}] {traceback.format_exc()}", file=sys.stderr)
-        return _error(f"{type(e).__name__}: {e}")
+        if isinstance(e, ApiException):
+            # what FIC refused is exactly what the caller has to act on
+            return _error(f"{type(e).__name__}: {e}")
+        return _error(
+            f"{type(e).__name__} durante '{name}'. Il dettaglio è nel log del server."
+        )
 
 
 async def main():

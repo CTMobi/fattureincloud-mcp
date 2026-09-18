@@ -39,11 +39,11 @@ def _ann(read_only=False, destructive=False, idempotent=False, open_world=True):
         openWorldHint=open_world,
     )
 
-# ReceivedDocumentType, from the official OpenAPI spec
-# ponytail: a flat ceiling on the pages a single tool call reads; per-list
-# tuning only if a real company hits it
+# a flat ceiling on the pages a single tool call reads; per-list tuning only
+# if a real company hits it
 MAX_PAGES = 10
 
+# ReceivedDocumentType, from the official OpenAPI spec
 RECEIVED_DOCUMENT_TYPES = ("expense", "passive_credit_note", "passive_delivery_note", "self_invoice")
 
 ACCESS_TOKEN = os.getenv("FIC_ACCESS_TOKEN", "")
@@ -2054,8 +2054,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "year": year, "total_invoices": len(numbers),
                 "first_number": numbers[0] if numbers else None,
                 "last_number": numbers[-1] if numbers else None,
-                "continuous": len(gaps) == 0,
-                "status": "✓ Numerazione continua" if len(gaps) == 0 else f"⚠ Trovati {len(gaps)} problemi",
+                # a truncated read verified nothing about the invoices it never
+                # fetched: continuous would assert exactly that
+                "continuous": None if parziale else len(gaps) == 0,
+                "status": ("? Verifica parziale: nessun buco fra le fatture lette"
+                           if parziale and not gaps else
+                           f"⚠ Trovati {len(gaps)} problemi" if gaps else
+                           "✓ Numerazione continua"),
                 "gaps": gaps
             }
             if parziale:
@@ -2119,14 +2124,22 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     return _error(
                         f"Documento {doc_id} senza scadenze di pagamento: impossibile registrare l'incasso."
                     )
-                amount = round(_amount_due_of(d), 2)
-                ritenuta = round(_gross_of(d) - amount, 2)
-                if ritenuta:
-                    nota_importo = (
-                        f"Il documento non aveva scadenze: rata creata per {round(amount, 2)}, "
-                        f"cioè il lordo {round(_gross_of(d), 2)} meno {ritenuta} di ritenuta, "
-                        f"che il committente versa all'Erario e non al fornitore."
+                if status == "not_paid":
+                    return _error(
+                        f"Il documento {doc_id} non ha scadenze registrate: non c'è nessun "
+                        f"pagamento da annullare."
                     )
+                amount = round(_amount_due_of(d), 2)
+                lordo = round(_gross_of(d), 2)
+                ritenuta = round(lordo - amount, 2)
+                # a synthesized installment reads exactly like a stored one, so
+                # the response says which of the two it is every time
+                nota_importo = (
+                    f"Il documento non aveva scadenze: rata creata per {amount}, "
+                    + (f"cioè il lordo {lordo} meno {ritenuta} di ritenuta, che il "
+                       f"committente versa all'Erario e non al fornitore."
+                       if ritenuta else "pari al totale lordo del documento.")
+                )
                 payments = [{
                     "amount": amount,
                     "due_date": str(d.get("date", ""))[:10],

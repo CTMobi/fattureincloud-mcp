@@ -3233,22 +3233,6 @@ def test_set_payment_explains_the_synthesized_amount(server_module):
     assert "610" in nota and "110" in nota
 
 
-def test_set_payment_stays_quiet_when_nothing_was_withheld(server_module):
-    """No withholding, no divergence to explain."""
-    server = server_module
-    doc = _sdk_received(_received_doc([]))
-
-    with patch.object(server.received_api, "get_received_document",
-                      return_value=_doc_response(doc)), \
-         patch.object(server.received_api, "modify_received_document",
-                      return_value=_doc_response(doc)):
-        result = _run(server.call_tool("set_payment", {
-            "document_id": 99, "document_type": "received", "status": "paid",
-        }))
-
-    assert "nota_importo" not in json.loads(result[0].text)
-
-
 # --------------------------------------------------------------------------
 # review round 27
 # --------------------------------------------------------------------------
@@ -3484,3 +3468,61 @@ def test_create_invoice_sends_the_line_discount(server_module):
     assert json.loads(result[0].text)["success"] is True
     sent = create.call_args.kwargs["create_issued_document_request"]["data"]["items_list"][0]
     assert sent["discount"] == 10
+
+
+# --------------------------------------------------------------------------
+# review round 29
+# --------------------------------------------------------------------------
+
+def test_check_numeration_does_not_claim_continuity_it_did_not_verify(server_module):
+    """status is the string a model quotes first, with a tick in front of it."""
+    server = server_module
+    doc = MagicMock()
+    doc.to_dict.return_value = {"number": 1, "date": "2026-01-10"}
+    page = MagicMock()
+    page.data = [doc]
+    page.last_page = 500
+
+    with patch.object(server.issued_api, "list_issued_documents", return_value=page):
+        result = _run(server.call_tool("check_numeration", {"year": 2026}))
+
+    payload = json.loads(result[0].text)
+    assert payload["parziale"] is True
+    assert payload["continuous"] is None
+    assert "✓" not in payload["status"]
+
+
+def test_set_payment_does_not_invent_an_installment_to_clear(server_module):
+    """not_paid on a document with no schedule has nothing to clear: writing a
+    plan that did not exist is not what 'annulla' means."""
+    server = server_module
+    doc = _sdk_received(_received_doc([]))
+
+    with patch.object(server.received_api, "get_received_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.received_api, "modify_received_document") as modify:
+        result = _run(server.call_tool("set_payment", {
+            "document_id": 99, "document_type": "received", "status": "not_paid",
+        }))
+
+    assert not modify.called
+    assert json.loads(result[0].text)["success"] is False
+
+
+def test_set_payment_always_says_when_it_invented_the_installment(server_module):
+    """Without the note a synthesized installment reads exactly like a stored
+    one, withholding or not."""
+    server = server_module
+    doc = _sdk_received(_received_doc([]))
+
+    with patch.object(server.received_api, "get_received_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.received_api, "modify_received_document",
+                      return_value=_doc_response(doc)):
+        result = _run(server.call_tool("set_payment", {
+            "document_id": 99, "document_type": "received", "status": "paid",
+        }))
+
+    nota = json.loads(result[0].text)["nota_importo"]
+    assert "610" in nota
+    assert "ritenuta" not in nota.lower()

@@ -44,9 +44,12 @@ def get(
     if age > ttl.total_seconds():
         return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+    # An empty payload is a miss: either a failed fetch persisted by a version
+    # before 2.1.0, or a registry that costs one cheap call to re-read.
+    return value or None
 
 
 def put(resource: str, company_id: str | int, value: Any) -> None:
@@ -81,7 +84,11 @@ def cached(resource: str, ttl: timedelta = timedelta(hours=24)):
             if hit is not None:
                 return hit
             value = fn(*args, company_id=company_id, **kwargs)
-            put(resource, company_id, value)
+            # An empty result is indistinguishable from a failed fetch, and
+            # persisting it would serve that failure for the whole TTL. The
+            # cost is that a genuinely empty registry never gets cached.
+            if value:
+                put(resource, company_id, value)
             return value
         return wrapper
     return decorator

@@ -128,6 +128,8 @@ Claude will:
 
 `list_invoices` and `list_received_documents` return `{count, page, pages, truncated, documents}`. FattureInCloud caps a listing at 100 documents per request, and unrolling a whole year into a conversation is rarely what you want, so the tools read one page: `truncated: true` means there are more, and `page` asks for the next one. The `query` filter is applied to the page that was read, not to the whole year.
 
+`get_situation` and `check_numeration` aggregate the whole year instead, and stop at 10 pages per list: past that ceiling the response carries `parziale: true` with a note saying so, and `check_numeration` also returns `continuous: null` — a truncated read verified nothing about the invoices it never fetched, and the numbers missing from it are not gaps in the numbering.
+
 ## Caching
 
 To minimize redundant calls to the FattureInCloud API, this server caches client lookups, the cost-centers list, the payment accounts and the VAT registry locally as JSON files (default location `~/.fattureincloud-mcp/cache/`, scoped per `company_id`, 24-hour TTL). The cache is transparent: tool signatures don't change.

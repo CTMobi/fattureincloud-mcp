@@ -10,6 +10,7 @@ License: MIT
 
 import json
 import os
+import sys
 import traceback
 from datetime import datetime, timedelta
 
@@ -553,6 +554,12 @@ def build_items_list(items_data, negate=False):
             vat_type, error = resolve_vat_type(22 if rate is None else rate)
             if error:
                 return None, error
+        discount = item.get("discount")
+        if discount is not None and (isinstance(discount, bool)
+                                     or not isinstance(discount, (int, float))
+                                     or not 0 <= discount <= 100):
+            return None, (f"La riga in posizione {position} ha discount = {discount!r}: "
+                          "serve una percentuale fra 0 e 100.")
         net_price = item["net_price"]
         if negate:
             net_price = -abs(net_price)
@@ -561,6 +568,7 @@ def build_items_list(items_data, negate=False):
             "description": item.get("description", ""),
             "qty": item["qty"],
             "net_price": net_price,
+            "discount": discount or 0,
             # `value` is not sent (read-only): it is kept here only so the local
             # total matches what FIC will compute from the vat type.
             "vat": {"id": vat_type["id"]},
@@ -696,7 +704,8 @@ async def list_tools():
             "qty": {"type": "number", "description": "Quantità"},
             "net_price": {"type": "number", "description": "Prezzo netto unitario (sempre positivo)"},
             "vat_rate": {"type": "number", "description": "Aliquota IVA (es. 22). Risolta contro l'anagrafica IVA di FIC"},
-            "vat_id": {"type": ["integer", "string"], "description": "ID aliquota IVA (opzionale, vince su vat_rate: serve quando più aliquote hanno la stessa percentuale ma natura diversa)"}
+            "vat_id": {"type": ["integer", "string"], "description": "ID aliquota IVA (opzionale, vince su vat_rate: serve quando più aliquote hanno la stessa percentuale ma natura diversa)"},
+            "discount": {"type": "number", "minimum": 0, "maximum": 100, "description": "Sconto percentuale sulla riga (opzionale)"}
         },
         "required": ["name", "qty", "net_price"]
     }
@@ -2379,7 +2388,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text=f"Tool '{name}' non trovato")]
 
     except Exception as e:
-        return [TextContent(type="text", text=f"Errore: {str(e)}\n{traceback.format_exc()}")]
+        # the traceback carries local paths and internal structure, and an MCP
+        # client feeds whatever comes back into the conversation: it belongs on
+        # stderr, where whoever runs the server can read it
+        print(f"[{name}] {traceback.format_exc()}", file=sys.stderr)
+        return _error(f"{type(e).__name__}: {e}")
 
 
 async def main():

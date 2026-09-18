@@ -17,7 +17,7 @@ MCP server that connects Claude (Desktop, Code, or any MCP client) to **FattureI
 
 | Tool | Description |
 |------|-------------|
-| `list_invoices` | List issued invoices / credit notes / proformas by year / month (one page of 100, see `truncated`) |
+| `list_invoices` | List issued invoices / credit notes / proformas by year / month (one page of 100, see `truncated` and `page`) |
 | `get_invoice` | Full document detail by ID |
 | `get_pdf_url` | PDF URL and web link for a document |
 | `list_clients` | List clients with optional filter |
@@ -34,7 +34,7 @@ MCP server that connects Claude (Desktop, Code, or any MCP client) to **FattureI
 | `send_to_sdi` | Send invoice / credit note to the Italian e-invoice system (SDI) |
 | `get_invoice_status` | E-invoice status for a document |
 | `send_email` | Send a courtesy copy by email |
-| `list_received_documents` | List supplier documents (one page of 100, exposes `cost_center` when present) |
+| `list_received_documents` | List supplier documents (one page of 100, see `truncated` and `page`; exposes `cost_center` when present) |
 | `get_received_document` | Full detail of a received document by ID |
 | `create_received_document` | Create a passive document / expense (optional `cost_center`) |
 | `list_cost_centers` | List configured cost / revenue centers |

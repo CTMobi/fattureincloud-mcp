@@ -3445,3 +3445,42 @@ def test_check_numeration_says_when_it_did_not_read_the_whole_year(server_module
     payload = json.loads(result[0].text)
     assert payload["parziale"] is True
     assert "parziale" in payload["nota"].lower() or "buchi" in payload["nota"].lower()
+
+
+def test_an_unexpected_error_does_not_return_a_traceback(server_module, capsys):
+    """The catch-all handed the client local paths and internal structure, and
+    an MCP client puts that straight back into the conversation."""
+    server = server_module
+
+    with patch.object(server.issued_api, "list_issued_documents",
+                      side_effect=RuntimeError("boom at /home/someone/secret.py")):
+        result = _run(server.call_tool("list_invoices", {"year": 2026}))
+
+    payload = json.loads(result[0].text)
+    assert payload["success"] is False
+    assert "Traceback" not in result[0].text
+    assert "site-packages" not in result[0].text
+    assert "boom" in payload["error"]
+    # the detail is still available to whoever runs the server
+    assert "Traceback" in capsys.readouterr().err
+
+
+def test_create_invoice_sends_the_line_discount(server_module):
+    """build_items_list rebuilds the line from scratch, so a discount the
+    caller passed used to be dropped without a word — while _item_net applies
+    one on every path that echoes a stored line."""
+    server = server_module
+    created = MagicMock()
+    created.data.to_dict.return_value = _sdk_shaped(_issued_doc([_rate(1098.0, "2026-02-09")]))
+
+    with patch.object(server.issued_api, "create_issued_document",
+                      return_value=created) as create, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme", "ei_code": "A1"}):
+        result = _run(server.call_tool("create_invoice", {
+            "client_id": 5,
+            "items": [{"name": "Consulenza", "qty": 1, "net_price": 1000.0, "discount": 10}],
+        }))
+
+    assert json.loads(result[0].text)["success"] is True
+    sent = create.call_args.kwargs["create_issued_document_request"]["data"]["items_list"][0]
+    assert sent["discount"] == 10

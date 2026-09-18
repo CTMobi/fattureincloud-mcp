@@ -3692,3 +3692,44 @@ def test_an_api_error_does_not_carry_the_response_headers(server_module):
     assert "422" in payload["error"]
     assert "vat_id not found" in payload["error"]
     assert "session=zzz" not in payload["error"]
+
+
+# --------------------------------------------------------------------------
+# review round 35
+# --------------------------------------------------------------------------
+
+def test_set_payment_reports_every_warning_it_found(server_module):
+    """Three independent checks wrote to one variable: the last one to fire
+    erased the others, and the rows below stayed unqualified."""
+    server = server_module
+    doc = _sdk_shaped(_issued_doc([_rate(1220.0, "2026-02-09")]))
+    silent = {k: v for k, v in _sdk_shaped(_issued_doc([])).items()
+              if k != "payments_list"}
+    silent["items_list"] = []
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document",
+                      return_value=_doc_response(silent)):
+        result = _run(server.call_tool("set_payment", {
+            "document_id": 42, "document_type": "issued", "status": "paid",
+        }))
+
+    warning = json.loads(result[0].text)["warning"]
+    assert "inviate" in warning
+    assert "items_list" in warning
+
+
+def test_an_api_error_falls_back_to_the_deserialized_body(server_module):
+    """__init__ fills body from the raw response, but leaves it None when the
+    decode raises — and then what FIC refused is only in data."""
+    from fattureincloud_python_sdk.exceptions import ApiException
+    server = server_module
+    error = ApiException(status=422, reason="Unprocessable")
+    error.body = None
+    error.data = {"error": "vat_id not found"}
+
+    with patch.object(server.issued_api, "list_issued_documents", side_effect=error):
+        payload = json.loads(_run(server.call_tool("list_invoices", {"year": 2026}))[0].text)
+
+    assert "vat_id not found" in payload["error"]

@@ -2265,28 +2265,31 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             # given; staff describe it as a merge, but nothing guarantees it.
             # The response is the document as stored, so check it rather than
             # reporting a clean success over a document that lost its content.
-            warning = None
+            # the three checks are independent, so they accumulate: assigning one
+            # variable meant the last one to fire erased what the others found
+            warnings = []
             if stored is None:
                 # to_dict() drops keys whose value is None, so the schedule may
                 # simply not have been reported: the rows below are then the ones
                 # sent, and saying so is the difference from claiming they were read
-                warning = (
+                warnings.append(
                     "La risposta dell'API non riporta le scadenze: le rate qui sotto sono "
                     "quelle inviate, non quelle rilette dal documento. Verificale dal "
                     "pannello FattureInCloud."
                 )
             if doc_kind == "received" and (d.get("entity") or {}) and updated.get("entity") == {}:
-                warning = (
+                warnings.append(
                     "Il documento è tornato dall'API senza fornitore: la PUT potrebbe aver "
                     "sostituito il documento invece di aggiornarne solo le rate. Verificalo "
                     "dal pannello FattureInCloud prima di registrare altri pagamenti."
                 )
             if (d.get("items_list") or []) and updated.get("items_list") == []:
-                warning = (
+                warnings.append(
                     "Il documento è tornato dall'API senza items_list: la PUT potrebbe aver "
                     "sostituito il documento invece di aggiornarne solo le rate. Verifica le "
                     "righe dal pannello FattureInCloud prima di registrare altri pagamenti."
                 )
+            warning = " ".join(warnings) or None
 
             number = updated.get("number") or d.get("number") or d.get("invoice_number")
             counterparty = (updated.get("entity") or d.get("entity") or {}).get("name")
@@ -2434,8 +2437,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             # what FIC refused is exactly what the caller has to act on; str(e)
             # would add the response headers, which help nobody
             detail = f"{e.status} {e.reason}"
-            if e.body:
-                detail += f": {e.body}"
+            # __init__ fills body from the raw response, but leaves it None when
+            # that decode raises: the refusal is then only in the parsed data
+            refusal = e.data or e.body
+            if refusal:
+                detail += f": {refusal}"
             return _error(f"{type(e).__name__}: {detail}")
         return _error(
             f"{type(e).__name__} durante '{name}'. Il dettaglio è nel log del server."

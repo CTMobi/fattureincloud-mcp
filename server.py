@@ -8,6 +8,7 @@ Author: Mediaform s.c.r.l. (https://media-form.it)
 License: MIT
 """
 
+import calendar
 import json
 import os
 import sys
@@ -138,10 +139,9 @@ def fetch_revenue_centers(*, company_id):
 def fetch_payment_accounts(*, company_id):
     """Payment accounts (FIC `/info/payment_accounts`). Used to resolve the
     `payment_account` argument of `set_payment` by id or by name."""
-    try:
-        response = info_api.list_payment_accounts(company_id=company_id)
-    except Exception:
-        return []
+    # no fallback to []: an outage would read as a company with no accounts,
+    # and the shared error path already reports what FIC answered
+    response = info_api.list_payment_accounts(company_id=company_id)
     accounts = []
     for a in (response.data or []):
         d = a.to_dict() if hasattr(a, "to_dict") else dict(a)
@@ -160,8 +160,8 @@ def resolve_payment_account(value):
     against the cached account list. Returns (account, error_message)."""
     accounts = fetch_payment_accounts(company_id=COMPANY_ID)
     if not accounts:
-        return None, ("Impossibile leggere l'anagrafica conti (/info/payment_accounts): "
-                      "riprova, senza non si può indicare il conto.")
+        return None, ("L'anagrafica conti (/info/payment_accounts) è vuota: nessun conto "
+                      "a cui associare il pagamento.")
     names = [a["name"] for a in accounts]
 
     is_id = (isinstance(value, int) and not isinstance(value, bool)) or (
@@ -213,7 +213,9 @@ def _payment_entry(p):
     }
     if p.get("id"):
         entry["id"] = p["id"]
-    if entry["status"] == "paid" and p.get("paid_date"):
+    # whatever date the document stores, on whatever status: a reversed
+    # payment keeps its date, and a write that echoes the list must not drop it
+    if p.get("paid_date"):
         entry["paid_date"] = str(p["paid_date"])[:10]
     account = p.get("payment_account")
     if hasattr(account, "to_dict"):
@@ -253,6 +255,21 @@ def _payment_days_of(doc):
     if isinstance(days, bool) or not isinstance(days, int) or not 0 <= days <= 3650:
         return 30
     return days
+
+
+def _due_date(invoice_date, days, terms_type):
+    """Due date of a payment term. `standard` counts the days from the document
+    date. `end_of_month` counts them and then moves to the last day of the
+    month reached. FattureInCloud does not document which of the two Italian
+    conventions it applies; its own fix note for "30 giorni fine mese" names a
+    document dated the 31st before a 30-day month as the broken case, and the
+    document's day can only matter when the days are counted from it. If a
+    live check shows the other convention — end of the document's month, then
+    the days — this is the one line to change."""
+    due = invoice_date + timedelta(days=days)
+    if terms_type == "end_of_month":
+        due = due.replace(day=calendar.monthrange(due.year, due.month)[1])
+    return due
 
 
 def _page_count(response):
@@ -1398,7 +1415,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             payment_days = _payment_days_of(orig)
             payment_terms_type = _enum_value(_payment_terms_of(orig).get("type")) or "standard"
 
-            due_date = invoice_date + timedelta(days=payment_days)
+            due_date = _due_date(invoice_date, payment_days, payment_terms_type)
             total_gross = sum(_item_net(i) * (1 + _vat_value(i) / 100) for i in items_list)
 
             revenue_center = arguments.get("revenue_center") or orig.get("rc_center")
@@ -1510,7 +1527,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 return _error(days_error)
             payment_terms_type = _enum_value(_payment_terms_of(orig).get("type")) or "standard"
 
-            due_date = invoice_date + timedelta(days=payment_days)
+            due_date = _due_date(invoice_date, payment_days, payment_terms_type)
             total_abs = sum(
                 abs(_item_net(i)) * (1 + _vat_value(i) / 100)
                 for i in items_list
@@ -1730,7 +1747,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 return _error(days_error)
             payment_terms_type = _enum_value(_payment_terms_of(orig).get("type")) or "standard"
 
-            due_date = invoice_date + timedelta(days=payment_days)
+            due_date = _due_date(invoice_date, payment_days, payment_terms_type)
             total_gross = sum(_item_net(i) * (1 + _vat_value(i) / 100) for i in items_list)
 
             revenue_center = arguments.get("revenue_center") or orig.get("rc_center")
@@ -2238,7 +2255,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     f"Verificalo dal pannello FattureInCloud prima di riprovare."
                 )
 
-            account_names = {a["id"]: a["name"] for a in fetch_payment_accounts(company_id=COMPANY_ID)}
+            # the names are decoration on a write that already happened: a
+            # registry unreadable now must not report that write as failed
+            try:
+                account_names = {a["id"]: a["name"] for a in fetch_payment_accounts(company_id=COMPANY_ID)}
+            except Exception as e:
+                print(f"[{name}] conti non leggibili dopo la scrittura: {e!r}", file=sys.stderr)
+                account_names = {}
             totale_pagato = residuo = 0.0
             view = []
             for i, p in enumerate(stored or payments):

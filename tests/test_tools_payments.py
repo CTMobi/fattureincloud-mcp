@@ -770,15 +770,17 @@ def test_resolve_payment_account_unknown_id(server_module):
 
 
 def test_payment_accounts_api_failure_is_not_cached(server_module):
-    """A transient failure must not poison the 24h cache with an empty list,
-    or every payment_account stays unresolvable for a day."""
+    """A transient failure must not poison the 24h cache, or every
+    payment_account stays unresolvable for a day. Since round 42 the failure
+    propagates instead of reading as an empty list; nothing is written either way."""
     server = server_module
     import cache as cache_mod
     cache_mod.invalidate_all(100)
 
     with patch.object(server.info_api, "list_payment_accounts",
                       side_effect=RuntimeError("503")):
-        assert server.fetch_payment_accounts(company_id=100) == []
+        with pytest.raises(RuntimeError):
+            server.fetch_payment_accounts(company_id=100)
 
     with patch.object(server.info_api, "list_payment_accounts",
                       return_value=_accounts_response(ACCOUNTS)):
@@ -1270,6 +1272,8 @@ def test_update_document_preserves_end_of_month_terms(server_module):
 
     sent = _sent_payments(modify, "modify_issued_document_request")
     assert sent[0]["payment_terms"]["type"] == "end_of_month"
+    # days: 0 on 2026-01-10 — the label is not enough, the date has to follow it
+    assert sent[0]["due_date"] == "2026-01-31"
 
 
 def test_update_document_preserves_stored_item_fields(server_module):
@@ -1941,11 +1945,13 @@ def test_duplicate_invoice_preserves_end_of_month_terms(server_module):
                       return_value=created) as create, \
          patch.object(server, "get_client_by_id", return_value={"name": "Acme", "ei_code": "A1"}):
         _run(server.call_tool("duplicate_invoice", {
-            "source_document_id": 42, "new_date": "2026-03-01",
+            "source_document_id": 42, "new_date": "2026-03-05",
         }))
 
     payment = create.call_args.kwargs["create_issued_document_request"]["data"]["payments_list"][0]
     assert payment["payment_terms"] == {"days": 30, "type": "end_of_month"}
+    # 2026-03-05 + 30 = 2026-04-04, then to the end of that month
+    assert payment["due_date"] == "2026-04-30"
 
 
 @pytest.mark.parametrize("arguments", [
@@ -2592,19 +2598,22 @@ def test_set_payment_keeps_the_payment_account_type(server_module):
     assert sent[0]["payment_account"] == {"id": 110, "type": "bank"}
 
 
-def test_resolve_payment_account_reports_an_unreadable_registry(server_module):
-    """Its VAT twin distinguishes the outage; this one said the account does
-    not exist, and the obvious retry registers the incasso with no account."""
+def test_resolve_payment_account_reports_an_empty_registry(server_module):
+    """An outage propagates to the shared error path (round 42); what is left
+    for this branch is a registry with nothing in it — not an account that
+    does not exist, and not something a retry fixes."""
     server = server_module
     import cache as cache_mod
     cache_mod.invalidate_all(100)
 
-    with patch.object(server.info_api, "list_payment_accounts", side_effect=RuntimeError("503")):
+    with patch.object(server.info_api, "list_payment_accounts",
+                      return_value=_accounts_response([])):
         account, error = server.resolve_payment_account("Banca Intesa")
 
     assert account is None
-    assert "anagrafica conti" in error
+    assert "vuota" in error
     assert "non esiste" not in error
+    assert "riprova" not in error
 
 
 def test_resolve_vat_type_reports_an_unreadable_registry(server_module):
@@ -3832,3 +3841,157 @@ def test_set_payment_flags_a_document_that_lost_its_counterparty(server_module, 
     warning = json.loads(result[0].text)["warning"]
     assert f"senza {named}" in warning
     assert other not in warning
+
+
+# --------------------------------------------------------------------------
+# review round 42
+# --------------------------------------------------------------------------
+
+def test_payment_entry_keeps_the_paid_date_of_a_reversed_installment(server_module):
+    """The serializer echoes an installment back as read. A reversed payment
+    that still carries its paid_date lost it on every unrelated write, because
+    the date was kept only for `paid`."""
+    server = server_module
+    doc = _issued_doc([_rate(1220.0, "2026-02-09", "reversed", paid_date="2026-02-05")])
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document",
+                      return_value=_doc_response(doc)) as modify, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme"}):
+        _run(server.call_tool("update_document", {
+            "document_id": 42, "visible_subject": "Nuovo oggetto",
+        }))
+
+    sent = _sent_payments(modify, "modify_issued_document_request")
+    assert sent[0]["status"] == "reversed"
+    assert sent[0]["paid_date"] == "2026-02-05"
+
+
+def test_list_payment_accounts_reports_an_outage_instead_of_an_empty_registry(server_module):
+    """`[]` during an outage reads as a company with no accounts."""
+    from fattureincloud_python_sdk.exceptions import ApiException
+    server = server_module
+    import cache as cache_mod
+    cache_mod.invalidate_all(100)
+
+    with patch.object(server.info_api, "list_payment_accounts",
+                      side_effect=ApiException(status=503, reason="Service Unavailable")):
+        result = _run(server.call_tool("list_payment_accounts", {}))
+
+    payload = json.loads(result[0].text)
+    assert payload["success"] is False
+    assert "503" in payload["error"]
+
+
+def test_set_payment_does_not_write_when_the_account_registry_is_unreachable(server_module):
+    """With the account unresolvable the write must not happen, and the
+    answer has to be the API failure, not a message about the account."""
+    from fattureincloud_python_sdk.exceptions import ApiException
+    server = server_module
+    import cache as cache_mod
+    cache_mod.invalidate_all(100)
+    doc = _issued_doc([_rate(1220.0, "2026-02-09")])
+
+    with patch.object(server.info_api, "list_payment_accounts",
+                      side_effect=ApiException(status=503, reason="Service Unavailable")), \
+         patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document") as modify:
+        result = _run(server.call_tool("set_payment", {
+            "document_id": 42, "document_type": "issued", "status": "paid",
+            "payment_account": "Banca Intesa",
+        }))
+
+    payload = json.loads(result[0].text)
+    assert payload["success"] is False
+    assert "503" in payload["error"]
+    assert "non esiste" not in payload["error"]
+    assert modify.call_count == 0
+
+
+def test_set_payment_reports_the_write_when_only_the_account_names_are_unreadable(server_module):
+    """The registry is read again after the write, to name the accounts in the
+    answer. A failure there must not turn a registered payment into an error:
+    the caller would retry, or worse, believe nothing was written."""
+    from fattureincloud_python_sdk.exceptions import ApiException
+    server = server_module
+    import cache as cache_mod
+    cache_mod.invalidate_all(100)
+    doc = _issued_doc([_rate(1220.0, "2026-02-09")])
+    paid = _issued_doc([_rate(1220.0, "2026-02-09", "paid", paid_date="2026-02-05")])
+
+    with patch.object(server.info_api, "list_payment_accounts",
+                      side_effect=ApiException(status=503, reason="Service Unavailable")), \
+         patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document",
+                      return_value=_doc_response(paid)) as modify:
+        result = _run(server.call_tool("set_payment", {
+            "document_id": 42, "document_type": "issued", "status": "paid",
+            "paid_date": "2026-02-05",
+        }))
+
+    payload = json.loads(result[0].text)
+    assert modify.call_count == 1
+    assert payload["success"] is True
+    assert payload["payments"][0]["status"] == "paid"
+
+
+def test_due_date_end_of_month_counts_the_days_then_closes_the_month(server_module):
+    """FattureInCloud's own fix note names a document dated the 31st before a
+    30-day month as the case that broke `30 giorni fine mese`: the day count
+    comes first, the month end after."""
+    from datetime import date
+    server = server_module
+    assert server._due_date(date(2026, 3, 31), 30, "end_of_month") == date(2026, 4, 30)
+    assert server._due_date(date(2026, 1, 10), 0, "end_of_month") == date(2026, 1, 31)
+    assert server._due_date(date(2026, 1, 10), 30, "standard") == date(2026, 2, 9)
+
+
+def test_update_document_reschedules_an_end_of_month_installment_to_the_month_end(server_module):
+    """The one branch that never hands the installment to fix_payments: a
+    settled single installment whose only change is the schedule. It kept the
+    fine-mese label and wrote a mid-month date under it."""
+    server = server_module
+    doc = _issued_doc([_rate(1220.0, "2026-01-31", "paid", paid_date="2026-01-20",
+                             payment_account={"id": 110, "name": "Banca Intesa"},
+                             payment_terms={"days": 0, "type": "end_of_month"})])
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document",
+                      return_value=_doc_response(doc)) as modify, \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme"}):
+        _run(server.call_tool("update_document", {"document_id": 42, "payment_days": 30}))
+
+    sent = _sent_payments(modify, "modify_issued_document_request")
+    assert len(sent) == 1
+    assert sent[0]["status"] == "paid"
+    assert sent[0]["paid_date"] == "2026-01-20"
+    assert sent[0]["payment_terms"] == {"days": 30, "type": "end_of_month"}
+    # 2026-01-10 + 30 = 2026-02-09, then to the end of February
+    assert sent[0]["due_date"] == "2026-02-28"
+
+
+def test_convert_proforma_keeps_end_of_month_terms_and_closes_the_month(server_module):
+    """The third path that recomputes a due date under a preserved label."""
+    server = server_module
+    proforma = _issued_doc([_rate(1220.0, "2026-02-28",
+                                  payment_terms={"days": 30, "type": "end_of_month"})])
+    proforma["type"] = "proforma"
+    created = MagicMock()
+    created.data.to_dict.return_value = {"id": 11, "number": 3, "date": "2026-03-05"}
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(proforma)), \
+         patch.object(server.issued_api, "create_issued_document",
+                      return_value=created) as create, \
+         patch.object(server.issued_api, "delete_issued_document"), \
+         patch.object(server, "get_client_by_id", return_value={"name": "Acme", "ei_code": "A1"}):
+        _run(server.call_tool("convert_proforma_to_invoice",
+                              {"document_id": 10, "date": "2026-03-05"}))
+
+    payment = create.call_args.kwargs["create_issued_document_request"]["data"]["payments_list"][0]
+    assert payment["payment_terms"] == {"days": 30, "type": "end_of_month"}
+    assert payment["due_date"] == "2026-04-30"

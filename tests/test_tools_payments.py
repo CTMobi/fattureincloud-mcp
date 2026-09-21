@@ -3946,7 +3946,11 @@ def test_due_date_end_of_month_counts_the_days_then_closes_the_month(server_modu
     comes first, the month end after."""
     from datetime import date
     server = server_module
+    # the FIC case itself cannot tell the two conventions apart (both give
+    # 30/04, and so does `standard`): it documents the motivation, not the rule
     assert server._due_date(date(2026, 3, 31), 30, "end_of_month") == date(2026, 4, 30)
+    # this one can: end of the document's month, then 30 days, would be 02/03
+    assert server._due_date(date(2026, 1, 15), 30, "end_of_month") == date(2026, 2, 28)
     assert server._due_date(date(2026, 1, 10), 0, "end_of_month") == date(2026, 1, 31)
     assert server._due_date(date(2026, 1, 10), 30, "standard") == date(2026, 2, 9)
 

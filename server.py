@@ -265,7 +265,7 @@ def _due_date(invoice_date, days, terms_type):
     document dated the 31st before a 30-day month as the broken case, and the
     document's day can only matter when the days are counted from it. If a
     live check shows the other convention — end of the document's month, then
-    the days — this is the one line to change."""
+    the days — this is the function to change."""
     due = invoice_date + timedelta(days=days)
     if terms_type == "end_of_month":
         due = due.replace(day=calendar.monthrange(due.year, due.month)[1])

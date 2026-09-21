@@ -3801,22 +3801,34 @@ def test_an_api_error_with_only_a_body_does_not_start_with_a_colon(server_module
     assert "ApiException: {" in payload["error"]
 
 
-def test_set_payment_flags_an_issued_document_that_lost_its_client(server_module):
+@pytest.mark.parametrize("kind,named,other", [
+    ("issued", "cliente", "fornitore"),
+    ("received", "fornitore", "cliente"),
+])
+def test_set_payment_flags_a_document_that_lost_its_counterparty(server_module, kind, named, other):
     """items_list was the only guard on issued documents, so one with no lines
-    had nothing watching it."""
+    had nothing watching it — and the received half of the same condition, which
+    predates the change, had no test emptying the entity in the response."""
     server = server_module
-    doc = _sdk_shaped(dict(_issued_doc([_rate(1220.0, "2026-02-09")]), items_list=[]))
-    wiped = dict(_sdk_shaped(_issued_doc([_rate(1220.0, "2026-02-09", status="paid")])),
-                 entity={}, items_list=[])
+    if kind == "issued":
+        doc = _sdk_shaped(dict(_issued_doc([_rate(1220.0, "2026-02-09")]), items_list=[]))
+        wiped = dict(_sdk_shaped(_issued_doc([_rate(1220.0, "2026-02-09", status="paid")])),
+                     entity={}, items_list=[])
+        api, getter, modifier = (server.issued_api, "get_issued_document",
+                                 "modify_issued_document")
+    else:
+        doc = _sdk_received(_received_doc([_rate(610.0, "2026-02-09")]))
+        wiped = dict(_sdk_received(_received_doc([_rate(610.0, "2026-02-09", status="paid")])),
+                     entity={})
+        api, getter, modifier = (server.received_api, "get_received_document",
+                                 "modify_received_document")
 
-    with patch.object(server.issued_api, "get_issued_document",
-                      return_value=_doc_response(doc)), \
-         patch.object(server.issued_api, "modify_issued_document",
-                      return_value=_doc_response(wiped)):
+    with patch.object(api, getter, return_value=_doc_response(doc)), \
+         patch.object(api, modifier, return_value=_doc_response(wiped)):
         result = _run(server.call_tool("set_payment", {
-            "document_id": 42, "document_type": "issued", "status": "paid",
+            "document_id": 42, "document_type": kind, "status": "paid",
         }))
 
     warning = json.loads(result[0].text)["warning"]
-    assert "senza cliente" in warning
-    assert "fornitore" not in warning
+    assert f"senza {named}" in warning
+    assert other not in warning

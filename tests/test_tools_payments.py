@@ -3817,4 +3817,6 @@ def test_set_payment_flags_an_issued_document_that_lost_its_client(server_module
             "document_id": 42, "document_type": "issued", "status": "paid",
         }))
 
-    assert "senza" in json.loads(result[0].text)["warning"]
+    warning = json.loads(result[0].text)["warning"]
+    assert "senza cliente" in warning
+    assert "fornitore" not in warning

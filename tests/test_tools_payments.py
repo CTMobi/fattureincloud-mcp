@@ -1256,7 +1256,7 @@ def test_update_document_preserves_end_of_month_terms(server_module):
     """payment_terms.type is an enum with end_of_month in it: rebuilding an
     installment must not silently convert a fine-mese schedule."""
     server = server_module
-    doc = _issued_doc([_rate(1220.0, "2026-02-28",
+    doc = _issued_doc([_rate(1220.0, "2026-01-31",
                              payment_terms={"days": 0, "type": "end_of_month"})])
 
     with patch.object(server.issued_api, "get_issued_document",
@@ -1934,7 +1934,8 @@ def test_duplicate_invoice_preserves_end_of_month_terms(server_module):
     """The third rebuild path: it computed the terms type and then wrote the
     constant anyway."""
     server = server_module
-    doc = _issued_doc([_rate(1220.0, "2026-02-28",
+    # the stored due date is what the rule gives for 10/01 + 10 fine mese
+    doc = _issued_doc([_rate(1220.0, "2026-01-31",
                              payment_terms={"days": 10, "type": "end_of_month"})])
     created = MagicMock()
     created.data.to_dict.return_value = {"id": 2, "number": 9, "date": "2026-03-01"}
@@ -3984,7 +3985,7 @@ def test_update_document_reschedules_an_end_of_month_installment_to_the_month_en
 def test_convert_proforma_keeps_end_of_month_terms_and_closes_the_month(server_module):
     """The third path that recomputes a due date under a preserved label."""
     server = server_module
-    proforma = _issued_doc([_rate(1220.0, "2026-02-28",
+    proforma = _issued_doc([_rate(1220.0, "2026-01-31",
                                   payment_terms={"days": 10, "type": "end_of_month"})])
     proforma["type"] = "proforma"
     created = MagicMock()

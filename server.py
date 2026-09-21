@@ -2277,6 +2277,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     "quelle inviate, non quelle rilette dal documento. Verificale dal "
                     "pannello FattureInCloud."
                 )
+            # these two compare against {} and [] on purpose, unlike the check on
+            # payments_list above: an absent key makes the response assert nothing
+            # — `counterparty` falls back to the document read a moment earlier,
+            # which is a real read, and the line items are not reported at all
             if doc_kind == "received" and (d.get("entity") or {}) and updated.get("entity") == {}:
                 warnings.append(
                     "Il documento è tornato dall'API senza fornitore: la PUT potrebbe aver "
@@ -2445,7 +2449,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             # that decode raises: the refusal is then only in the parsed data
             refusal = getattr(e, "data", None) or getattr(e, "body", None)
             if status or reason or refusal:
-                detail = f"{status} {reason}"
+                detail = " ".join(str(x) for x in (status, reason) if x)
                 if refusal:
                     detail += f": {refusal}"
                 return _error(f"{type(e).__name__}: {detail}")

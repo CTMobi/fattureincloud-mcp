@@ -3758,3 +3758,25 @@ def test_an_api_error_without_the_expected_attributes_still_answers(server_modul
     # "ApiException: None None" says neither what failed nor where to look
     assert "None None" not in payload["error"]
     assert "list_invoices" in payload["error"]
+
+
+# --------------------------------------------------------------------------
+# review round 38
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("status,reason,expected", [
+    (422, None, "422"),
+    (None, "Unprocessable", "Unprocessable"),
+])
+def test_an_api_error_does_not_print_the_attribute_it_lacks(server_module, status, reason, expected):
+    """The guard is an `or`, so a half-populated exception still reached the
+    caller as `422 None`."""
+    from fattureincloud_python_sdk.exceptions import ApiException
+    server = server_module
+    error = ApiException(status=status, reason=reason)
+
+    with patch.object(server.issued_api, "list_issued_documents", side_effect=error):
+        payload = json.loads(_run(server.call_tool("list_invoices", {"year": 2026}))[0].text)
+
+    assert expected in payload["error"]
+    assert "None" not in payload["error"]

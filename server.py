@@ -2202,10 +2202,15 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
             for i in targets:
                 entry = payments[i]
+                stored_status = entry.get("status")
                 entry["status"] = status
                 if status == "paid":
-                    # replaying the call must not move an already registered payment
-                    if arguments.get("paid_date") is not None or not entry.get("paid_date"):
+                    # replaying the call must not move an already registered
+                    # payment — but a reversed one was not collected, so the
+                    # date it carries is not the date of this collection
+                    if (arguments.get("paid_date") is not None
+                            or stored_status != "paid"
+                            or not entry.get("paid_date")):
                         entry["paid_date"] = paid_date
                     if account:
                         entry["payment_account"] = {"id": account["id"]}
@@ -2261,7 +2266,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 account_names = {a["id"]: a["name"] for a in fetch_payment_accounts(company_id=COMPANY_ID)}
             except Exception as e:
                 print(f"[{name}] conti non leggibili dopo la scrittura: {e!r}", file=sys.stderr)
-                account_names = {}
+                account_names = None
             totale_pagato = residuo = 0.0
             view = []
             for i, p in enumerate(stored or payments):
@@ -2276,8 +2281,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 if entry.get("paid_date"):
                     row["paid_date"] = entry["paid_date"]
                 if entry.get("payment_account"):
+                    # the id is the stored one; a name nobody could read is
+                    # left out rather than reported as null
                     account_id = entry["payment_account"]["id"]
-                    row["payment_account"] = {"id": account_id, "name": account_names.get(account_id)}
+                    row["payment_account"] = {"id": account_id}
+                    if account_id in (account_names or {}):
+                        row["payment_account"]["name"] = account_names[account_id]
                 if entry.get("status") == "paid":
                     totale_pagato += amount
                 else:
@@ -2288,9 +2297,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             # given; staff describe it as a merge, but nothing guarantees it.
             # The response is the document as stored, so check it rather than
             # reporting a clean success over a document that lost its content.
-            # the three checks are independent, so they accumulate: assigning one
+            # the checks are independent, so they accumulate: assigning one
             # variable meant the last one to fire erased what the others found
             warnings = []
+            if account_names is None and any("payment_account" in r for r in view):
+                warnings.append(
+                    "Nomi dei conti non disponibili: l'anagrafica conti non è leggibile al "
+                    "momento, gli id sono quelli registrati sul documento."
+                )
             if stored is None:
                 # to_dict() drops keys whose value is None, so the schedule may
                 # simply not have been reported: the rows below are then the ones

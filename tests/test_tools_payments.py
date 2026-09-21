@@ -3936,6 +3936,8 @@ def test_set_payment_reports_the_write_when_only_the_account_names_are_unreadabl
     assert modify.call_count == 1
     assert payload["success"] is True
     assert payload["payments"][0]["status"] == "paid"
+    # no row carries an account, so nothing was lost and nothing is flagged
+    assert payload.get("warning") is None
 
 
 def test_due_date_end_of_month_counts_the_days_then_closes_the_month(server_module):
@@ -3995,3 +3997,58 @@ def test_convert_proforma_keeps_end_of_month_terms_and_closes_the_month(server_m
     payment = create.call_args.kwargs["create_issued_document_request"]["data"]["payments_list"][0]
     assert payment["payment_terms"] == {"days": 30, "type": "end_of_month"}
     assert payment["due_date"] == "2026-04-30"
+
+
+# --------------------------------------------------------------------------
+# review round 43
+# --------------------------------------------------------------------------
+
+def test_set_payment_collects_a_reversed_installment_today(server_module):
+    """A reversed installment now keeps the date of the payment that bounced.
+    The replay guard read "already registered" off the presence of that date,
+    so collecting the installment again kept the old date instead of today's."""
+    server = server_module
+    today = datetime.now().strftime("%Y-%m-%d")
+    doc = _issued_doc([_rate(1220.0, "2026-02-09", "reversed", paid_date="2026-02-05")])
+    paid = _issued_doc([_rate(1220.0, "2026-02-09", "paid", paid_date=today)])
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document",
+                      return_value=_doc_response(paid)) as modify:
+        _run(server.call_tool("set_payment", {
+            "document_id": 42, "document_type": "issued", "status": "paid",
+        }))
+
+    sent = _sent_payments(modify, "modify_issued_document_request")
+    assert sent[0]["status"] == "paid"
+    assert sent[0]["paid_date"] == today
+
+
+def test_set_payment_names_no_account_it_could_not_read(server_module):
+    """With the registry unreadable after the write, `"name": null` read as an
+    account without a name. The id is the stored one and stays; the name is
+    omitted and the answer says why."""
+    from fattureincloud_python_sdk.exceptions import ApiException
+    server = server_module
+    import cache as cache_mod
+    cache_mod.invalidate_all(100)
+    doc = _issued_doc([_rate(1220.0, "2026-02-09")])
+    paid = _issued_doc([_rate(1220.0, "2026-02-09", "paid", paid_date="2026-02-05",
+                              payment_account={"id": 110})])
+
+    with patch.object(server.info_api, "list_payment_accounts",
+                      side_effect=ApiException(status=503, reason="Service Unavailable")), \
+         patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document",
+                      return_value=_doc_response(paid)):
+        result = _run(server.call_tool("set_payment", {
+            "document_id": 42, "document_type": "issued", "status": "paid",
+            "paid_date": "2026-02-05",
+        }))
+
+    payload = json.loads(result[0].text)
+    assert payload["success"] is True
+    assert payload["payments"][0]["payment_account"] == {"id": 110}
+    assert "conti" in payload["warning"]

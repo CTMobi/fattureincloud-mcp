@@ -2280,10 +2280,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             # these two compare against {} and [] on purpose, unlike the check on
             # payments_list above: an absent key makes the response assert nothing
             # — `counterparty` falls back to the document read a moment earlier,
-            # which is a real read, and the line items are not reported at all
-            if doc_kind == "received" and (d.get("entity") or {}) and updated.get("entity") == {}:
+            # which is a real read, and the line items are not reported at all.
+            # Both run on either kind: an issued document with no lines would
+            # otherwise have nothing watching it.
+            if (d.get("entity") or {}) and updated.get("entity") == {}:
                 warnings.append(
-                    "Il documento è tornato dall'API senza fornitore: la PUT potrebbe aver "
+                    f"Il documento è tornato dall'API senza "
+                    f"{'fornitore' if doc_kind == 'received' else 'cliente'}: la PUT potrebbe aver "
                     "sostituito il documento invece di aggiornarne solo le rate. Verificalo "
                     "dal pannello FattureInCloud prima di registrare altri pagamenti."
                 )
@@ -2451,7 +2454,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             if status or reason or refusal:
                 detail = " ".join(str(x) for x in (status, reason) if x)
                 if refusal:
-                    detail += f": {refusal}"
+                    detail = f"{detail}: {refusal}" if detail else str(refusal)
                 return _error(f"{type(e).__name__}: {detail}")
             # none of the four: fall through, since the generic message at least
             # names the tool and says the detail is in the server log

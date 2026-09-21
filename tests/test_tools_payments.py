@@ -3780,3 +3780,41 @@ def test_an_api_error_does_not_print_the_attribute_it_lacks(server_module, statu
 
     assert expected in payload["error"]
     assert "None" not in payload["error"]
+
+
+# --------------------------------------------------------------------------
+# review round 39
+# --------------------------------------------------------------------------
+
+def test_an_api_error_with_only_a_body_does_not_start_with_a_colon(server_module):
+    """The join left `detail` empty, so the refusal arrived as `: {...}`."""
+    from fattureincloud_python_sdk.exceptions import ApiException
+    server = server_module
+    error = ApiException()
+    error.data = {"error": "vat_id not found"}
+
+    with patch.object(server.issued_api, "list_issued_documents", side_effect=error):
+        payload = json.loads(_run(server.call_tool("list_invoices", {"year": 2026}))[0].text)
+
+    assert "vat_id not found" in payload["error"]
+    assert ": :" not in payload["error"]
+    assert "ApiException: {" in payload["error"]
+
+
+def test_set_payment_flags_an_issued_document_that_lost_its_client(server_module):
+    """items_list was the only guard on issued documents, so one with no lines
+    had nothing watching it."""
+    server = server_module
+    doc = _sdk_shaped(dict(_issued_doc([_rate(1220.0, "2026-02-09")]), items_list=[]))
+    wiped = dict(_sdk_shaped(_issued_doc([_rate(1220.0, "2026-02-09", status="paid")])),
+                 entity={}, items_list=[])
+
+    with patch.object(server.issued_api, "get_issued_document",
+                      return_value=_doc_response(doc)), \
+         patch.object(server.issued_api, "modify_issued_document",
+                      return_value=_doc_response(wiped)):
+        result = _run(server.call_tool("set_payment", {
+            "document_id": 42, "document_type": "issued", "status": "paid",
+        }))
+
+    assert "senza" in json.loads(result[0].text)["warning"]

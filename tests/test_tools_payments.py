@@ -3753,4 +3753,8 @@ def test_an_api_error_without_the_expected_attributes_still_answers(server_modul
     with patch.object(server.issued_api, "list_issued_documents", side_effect=Sparse()):
         result = _run(server.call_tool("list_invoices", {"year": 2026}))
 
-    assert json.loads(result[0].text)["success"] is False
+    payload = json.loads(result[0].text)
+    assert payload["success"] is False
+    # "ApiException: None None" says neither what failed nor where to look
+    assert "None None" not in payload["error"]
+    assert "list_invoices" in payload["error"]

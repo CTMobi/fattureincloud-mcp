@@ -2439,13 +2439,18 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             # these four belong to the generated runtime, not to a declared API:
             # an AttributeError raised here would escape call_tool and leave the
             # client without a response at all
-            detail = f"{getattr(e, 'status', None)} {getattr(e, 'reason', None)}"
+            status = getattr(e, "status", None)
+            reason = getattr(e, "reason", None)
             # __init__ fills body from the raw response, but leaves it None when
             # that decode raises: the refusal is then only in the parsed data
             refusal = getattr(e, "data", None) or getattr(e, "body", None)
-            if refusal:
-                detail += f": {refusal}"
-            return _error(f"{type(e).__name__}: {detail}")
+            if status or reason or refusal:
+                detail = f"{status} {reason}"
+                if refusal:
+                    detail += f": {refusal}"
+                return _error(f"{type(e).__name__}: {detail}")
+            # none of the four: fall through, since the generic message at least
+            # names the tool and says the detail is in the server log
         return _error(
             f"{type(e).__name__} durante '{name}'. Il dettaglio è nel log del server."
         )

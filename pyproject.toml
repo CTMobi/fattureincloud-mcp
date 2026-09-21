@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fattureincloud-mcp"
-version = "2.0.0"
+version = "2.1.0"
 description = "MCP Server for Fatture in Cloud API - Italian electronic invoicing with Claude AI"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -37,8 +37,8 @@ classifiers = [
     "Topic :: Office/Business :: Financial :: Accounting",
 ]
 dependencies = [
-    "fattureincloud-python-sdk>=2.0.0",
-    "mcp>=1.0.0",
+    "fattureincloud-python-sdk>=2.0.0,<3",
+    "mcp>=1.0.0,<2",
     "python-dotenv>=1.0.0",
 ]
 

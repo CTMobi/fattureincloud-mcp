@@ -114,3 +114,23 @@ def test_cached_decorator_passes_args_and_kwargs(tmp_cache):
 
     assert fetch("p", company_id=100, suffix="s") == "p-100-s"
     assert fetch("ignored", company_id=100, suffix="ignored") == "p-100-s"
+
+
+def test_empty_cache_file_is_a_miss(tmp_cache):
+    """Empty files written by the pre-2.1.0 caching bug must not keep serving
+    a failed fetch after the upgrade."""
+    cache.put("payment_accounts", 100, [])
+    assert cache.get("payment_accounts", 100) is None
+
+
+def test_cached_decorator_refetches_after_empty_result(tmp_cache):
+    calls = []
+
+    @cache.cached("payment_accounts")
+    def fetch(*, company_id):
+        calls.append(company_id)
+        return [] if len(calls) == 1 else [{"id": 110}]
+
+    assert fetch(company_id=100) == []
+    assert fetch(company_id=100) == [{"id": 110}]
+    assert len(calls) == 2

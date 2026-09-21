@@ -13,11 +13,11 @@ MCP server that connects Claude (Desktop, Code, or any MCP client) to **FattureI
 
 > ⚠️ **Unofficial integration.** Not affiliated with, endorsed by, or sponsored by TeamSystem S.p.A., owner of the FattureInCloud trademark. The trademark is used here for descriptive purposes only.
 
-## Features (23 tools)
+## Features (25 tools)
 
 | Tool | Description |
 |------|-------------|
-| `list_invoices` | List issued invoices / credit notes / proformas by year / month |
+| `list_invoices` | List issued invoices / credit notes / proformas by year / month (one page of 100, see `truncated` and `page`) |
 | `get_invoice` | Full document detail by ID |
 | `get_pdf_url` | PDF URL and web link for a document |
 | `list_clients` | List clients with optional filter |
@@ -34,14 +34,15 @@ MCP server that connects Claude (Desktop, Code, or any MCP client) to **FattureI
 | `send_to_sdi` | Send invoice / credit note to the Italian e-invoice system (SDI) |
 | `get_invoice_status` | E-invoice status for a document |
 | `send_email` | Send a courtesy copy by email |
-| `list_received_documents` | List supplier documents (exposes `cost_center` when present) |
+| `list_received_documents` | List supplier documents (one page of 100, see `truncated` and `page`; exposes `cost_center` when present) |
 | `get_received_document` | Full detail of a received document by ID |
 | `create_received_document` | Create a passive document / expense (optional `cost_center`) |
 | `list_cost_centers` | List configured cost / revenue centers |
-| `get_situation` | Yearly dashboard: net revenue, collected, outstanding, costs, margin |
-| `check_numeration` | Verify invoice numbering continuity |
+| `list_payment_accounts` | List configured payment accounts (banks, cash, cards) |
+| `set_payment` | Register / clear a payment on an issued or received document |
+| `get_situation` | Yearly dashboard: net revenue, collected, outstanding, costs, margin (10 pages per list, see `parziale`) |
+| `check_numeration` | Verify invoice numbering continuity (10 pages, see `parziale` and `continuous: null`) |
 
-> Marking payments as "paid" is intentionally not exposed: the FattureInCloud API requires a payment account that cannot be reliably retrieved through the SDK. Use the FattureInCloud web panel for that operation.
 
 ## Installation
 
@@ -123,9 +124,15 @@ Claude will:
 2. For each result, call `duplicate_invoice` with `new_date` set in November
 3. Return the list of new draft invoices and ask before sending
 
+## Listings
+
+`list_invoices` and `list_received_documents` return `{count, page, pages, truncated, documents}`. FattureInCloud caps a listing at 100 documents per request, and unrolling a whole year into a conversation is rarely what you want, so the tools read one page: `truncated: true` means there are more, and `page` asks for the next one. The `query` filter is applied to the page that was read, not to the whole year.
+
+`get_situation` and `check_numeration` aggregate the whole year instead, and stop at 10 pages per list: past that ceiling the response carries `parziale: true` with a note saying so, and `check_numeration` also returns `continuous: null` — a truncated read verified nothing about the invoices it never fetched, and the numbers missing from it are not gaps in the numbering.
+
 ## Caching
 
-To minimize redundant calls to the FattureInCloud API, this server caches client lookups and the cost-centers list locally as JSON files (default location `~/.fattureincloud-mcp/cache/`, scoped per `company_id`, 24-hour TTL). The cache is transparent: tool signatures don't change.
+To minimize redundant calls to the FattureInCloud API, this server caches client lookups, the cost-centers list, the payment accounts and the VAT registry locally as JSON files (default location `~/.fattureincloud-mcp/cache/`, scoped per `company_id`, 24-hour TTL). The cache is transparent: tool signatures don't change.
 
 ```bash
 # Force refresh:
@@ -134,6 +141,27 @@ rm -rf ~/.fattureincloud-mcp/cache
 # Disable temporarily:
 export FIC_CACHE_DISABLED=1
 ```
+
+## Payments (incassi and pagamenti)
+
+`set_payment` registers an incasso on an issued document or a pagamento on a received one. Unlike `update_document`, it also works on documents already sent to SDI — collecting an invoice after it cleared the SDI is the normal case.
+
+```
+set_payment(document_id, document_type="issued"|"received", status="paid"|"not_paid",
+            paid_date?, payment_account?, payment_index?)
+```
+
+- `paid_date` defaults to today — or, on an installment that is already `paid`, to the date it carries, so replaying the call does not move a payment; a `reversed` installment is collected again as of today. With `status="not_paid"` the paid date and the account are cleared.
+- `vat_rate` on a line is resolved against the VAT registry, since FattureInCloud ignores the percentage in the request body and reads the rate from the VAT type id. When several types share a percentage but differ in *natura* (the 0% ones — esente, non imponibile, fuori campo), the call is refused with the candidates and you pick one with `vat_id`.
+- `payment_account` accepts either the numeric id or the account name (case-insensitive, unique substrings work). Run `list_payment_accounts` to see what is configured. Without an account the payment is registered but does not land in FattureInCloud's cash flow. An account registry that cannot be read is reported as the API error it is, by both tools, not as an empty list or a missing account — except after the write, when it is read only to name the accounts: the answer then keeps the ids, omits the names and says so in a `warning`.
+- **Installments:** documents with a single installment need no `payment_index`. With more than one, the call is refused and returns the installment list (index, amount, due date) so you can pick — or pass `payment_index="all"` to settle every installment at once.
+- **Received documents with no schedule** — those created by `create_received_document` carry no `payments_list`. Marking one paid synthesizes an installment due on the document date for what the supplier is actually paid (gross less any ritenuta d'acconto), and the response carries a `nota_importo` saying so, since an installment this server invented otherwise reads like one FattureInCloud stored. `status="not_paid"` on such a document is refused: there is nothing registered to clear.
+
+**How the write works.** The document is read first, the whole installment list is sent back with the selected entries changed, and the document's own `type` (and `show_totals`) are echoed so the request models' defaults cannot re-type a credit note. The full list matters: an array in the request body replaces the stored one, so sending only the installment being paid would drop the others.
+
+FattureInCloud documents neither behaviour — the API reference and the OpenAPI spec say only *"Modifies the specified document."* and mark no field required. The one place the semantics are stated is the request body of `modifyClient` / `modifySupplier` (*"First level parameters are managed in delta mode"*), and it was never extended to documents. FIC staff describe the modify calls as a merge on the company's own forum ([discussion 295](https://github.com/fattureincloud/api/discussions/295)) and prescribe exactly this payments-only shape for marking an invoice paid ([discussion 239](https://github.com/fattureincloud/api/discussions/239)), with the array caveat above stated in [discussion 427](https://github.com/fattureincloud/api/discussions/427). None of that is a versioned guarantee, so `set_payment` checks the document the API returns instead of reporting a clean success over one that lost its content. A response whose `payments_list` comes back **explicitly empty** is refused — the installments were written and the document does not carry them, which is the one case where the tool answers `success: false` after a write, and what you need to know before retrying. A response that does not report the schedule at all, or that comes back without the counterparty it had — the client on an issued document, the supplier on a received one — or without its line items, carries a `warning` for each — the one on the schedule says the installments shown are the ones sent, not the ones read back.
+
+`update_document` refuses any edit that would rewrite the payment schedule. A registered payment on a single installment whose total would change has to be cleared with `set_payment` first — rewriting it would report cash that was never collected. An installment plan cannot be rebuilt through the API at all (flattening a 30/60/90 plan into one due date is a loss that cannot be undone), so it has to be changed in FattureInCloud. Edits that leave the schedule alone — subject, line descriptions, a new due date on a single installment, or re-sending values that did not actually change — keep working. A recomputed due date follows the document's payment terms: under `end_of_month` (fine mese) the days are counted from the document date and the result moved to the last day of the month reached. FattureInCloud does not document the rule; this is the reading its own fix note for "30 giorni fine mese" implies, and it sits in one function should a live check show the other convention.
 
 ## Cost / Revenue Centers
 

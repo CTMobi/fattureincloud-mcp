@@ -60,8 +60,14 @@ def server_module(tmp_path, monkeypatch):
         "certified_email": "",
     }
 
+    vat_response = MagicMock()
+    vat_type = MagicMock()
+    vat_type.to_dict.return_value = {"id": 0, "value": 22.0, "is_disabled": False, "default": True}
+    vat_response.data = [vat_type]
+
     with patch.object(server.info_api, "list_cost_centers", return_value=list_cc_response), \
          patch.object(server.info_api, "list_revenue_centers", return_value=list_rc_response), \
+         patch.object(server.info_api, "list_vat_types", return_value=vat_response), \
          patch.object(server.clients_api, "get_client", return_value=client_response):
         yield server
 
@@ -244,7 +250,7 @@ def test_list_invoices_includes_revenue_center(server_module):
     with patch.object(server.issued_api, "list_issued_documents", return_value=list_response):
         result = _run(server.call_tool("list_invoices", {"year": 2026}))
 
-    invoices = json.loads(result[0].text)
+    invoices = json.loads(result[0].text)["documents"]
     assert invoices[0]["revenue_center"] == "Project Alpha"
     assert "revenue_center" not in invoices[1]
 
@@ -402,6 +408,6 @@ def test_list_received_documents_includes_cost_center(server_module):
     with patch.object(server.received_api, "list_received_documents", return_value=list_response):
         result = _run(server.call_tool("list_received_documents", {"year": 2026}))
 
-    docs = json.loads(result[0].text)
+    docs = json.loads(result[0].text)["documents"]
     assert docs[0]["cost_center"] == "Project Alpha"
     assert "cost_center" not in docs[1]

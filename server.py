@@ -1073,7 +1073,7 @@ async def list_tools():
                         "enum": ["paid", "not_paid"],
                         "description": "paid = registra incasso/pagamento, not_paid = annulla la registrazione"
                     },
-                    "paid_date": {"type": "string", "description": "Data incasso/pagamento YYYY-MM-DD (default: oggi, oppure la data già registrata sulla rata). Ignorata con status not_paid"},
+                    "paid_date": {"type": "string", "description": "Data incasso/pagamento YYYY-MM-DD (default: oggi; su una rata già pagata resta la data registrata, così ripetere la chiamata non la sposta). Ignorata con status not_paid"},
                     "payment_account": {
                         "type": ["string", "integer"],
                         "description": "Conto su cui registrare: id numerico o nome (vedi list_payment_accounts). Opzionale; ignorato con status not_paid"

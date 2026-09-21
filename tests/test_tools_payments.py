@@ -1935,7 +1935,7 @@ def test_duplicate_invoice_preserves_end_of_month_terms(server_module):
     constant anyway."""
     server = server_module
     doc = _issued_doc([_rate(1220.0, "2026-02-28",
-                             payment_terms={"days": 30, "type": "end_of_month"})])
+                             payment_terms={"days": 10, "type": "end_of_month"})])
     created = MagicMock()
     created.data.to_dict.return_value = {"id": 2, "number": 9, "date": "2026-03-01"}
 
@@ -1949,9 +1949,10 @@ def test_duplicate_invoice_preserves_end_of_month_terms(server_module):
         }))
 
     payment = create.call_args.kwargs["create_issued_document_request"]["data"]["payments_list"][0]
-    assert payment["payment_terms"] == {"days": 30, "type": "end_of_month"}
-    # 2026-03-05 + 30 = 2026-04-04, then to the end of that month
-    assert payment["due_date"] == "2026-04-30"
+    assert payment["payment_terms"] == {"days": 10, "type": "end_of_month"}
+    # 2026-03-05 + 10 = 2026-03-15, then to the end of March. With 30 days both
+    # conventions met on 30/04 (April has 30 days); with 10 the other gives 10/04
+    assert payment["due_date"] == "2026-03-31"
 
 
 @pytest.mark.parametrize("arguments", [
@@ -3984,7 +3985,7 @@ def test_convert_proforma_keeps_end_of_month_terms_and_closes_the_month(server_m
     """The third path that recomputes a due date under a preserved label."""
     server = server_module
     proforma = _issued_doc([_rate(1220.0, "2026-02-28",
-                                  payment_terms={"days": 30, "type": "end_of_month"})])
+                                  payment_terms={"days": 10, "type": "end_of_month"})])
     proforma["type"] = "proforma"
     created = MagicMock()
     created.data.to_dict.return_value = {"id": 11, "number": 3, "date": "2026-03-05"}
@@ -3999,8 +4000,10 @@ def test_convert_proforma_keeps_end_of_month_terms_and_closes_the_month(server_m
                               {"document_id": 10, "date": "2026-03-05"}))
 
     payment = create.call_args.kwargs["create_issued_document_request"]["data"]["payments_list"][0]
-    assert payment["payment_terms"] == {"days": 30, "type": "end_of_month"}
-    assert payment["due_date"] == "2026-04-30"
+    assert payment["payment_terms"] == {"days": 10, "type": "end_of_month"}
+    # 2026-03-05 + 10 = 2026-03-15, then to the end of March (the other
+    # convention gives 10/04; with 30 days both landed on 30/04)
+    assert payment["due_date"] == "2026-03-31"
 
 
 # --------------------------------------------------------------------------
